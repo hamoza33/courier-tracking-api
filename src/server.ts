@@ -10,6 +10,24 @@ import { trackInjaz } from "./carriers/injaz.js";
 import { trackJt } from "./carriers/jt.js";
 import { trackJdw } from "./carriers/jdw.js";
 import { CarrierError, type Carrier, type TrackResult } from "./types.js";
+import { formatMultipleAsText, formatTrackResultAsText } from "./format.js";
+
+type MultiTrackResult = { carrier: string; result?: TrackResult; error?: { message: string; captchaRequired?: boolean } };
+
+function wantsText(req: import("fastify").FastifyRequest): boolean {
+  const q = req.query as Record<string, string | undefined> | undefined;
+  const fmt = (q?.format ?? "").toLowerCase();
+  if (fmt === "text" || fmt === "txt" || fmt === "plain") return true;
+  const accept = (req.headers.accept ?? "").toLowerCase();
+  if (accept.startsWith("text/plain")) return true;
+  return false;
+}
+
+function wantsPretty(req: import("fastify").FastifyRequest): boolean {
+  const q = req.query as Record<string, string | undefined> | undefined;
+  const v = (q?.pretty ?? "").toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
 
 const PORT = Number(process.env.PORT ?? 8080);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -125,35 +143,8 @@ async function start() {
 
   // ----- tracking endpoints -----
 
-  const trackResultSchema = {
-    type: "object",
-    properties: {
-      carrier: { type: "string" },
-      carrierName: { type: "string" },
-      waybillNo: { type: "string" },
-      found: { type: "boolean" },
-      latestStatus: { type: ["string", "null"] },
-      latestTime: { type: ["string", "null"] },
-      events: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            time: { type: ["string", "null"] },
-            status: { type: ["string", "null"] },
-            description: { type: "string" },
-            location: { type: ["string", "null"] },
-            timezone: { type: ["string", "null"] },
-          },
-        },
-      },
-      extra: { type: "object", additionalProperties: true },
-      warnings: { type: "array", items: { type: "string" } },
-    },
-  } as const;
-
-  // GET /track?waybill=...&lang=en[&carrier=imile]
-  fastify.get<{ Querystring: { waybill?: string; lang?: string; carrier?: string } }>(
+  // GET /track?waybill=...&lang=en[&carrier=imile][&format=text][&pretty=1]
+  fastify.get<{ Querystring: { waybill?: string; lang?: string; carrier?: string; format?: string; pretty?: string } }>(
     "/track",
     {
       schema: {
@@ -170,9 +161,17 @@ async function start() {
               enum: ["imile", "injaz", "jt", "jdw", "auto", "all"],
               description: "Force a specific carrier, or 'all' to query every carrier in parallel",
             },
+            format: {
+              type: "string",
+              enum: ["json", "text"],
+              description: "Response format. 'text' returns a plain-text timeline (one event per line).",
+            },
+            pretty: {
+              type: "string",
+              description: "Set to '1' to pretty-print JSON output.",
+            },
           },
         },
-        response: { 200: { oneOf: [trackResultSchema, { type: "array", items: trackResultSchema }] } },
       },
     },
     async (req, reply) => {
@@ -183,22 +182,26 @@ async function start() {
       const carrier = req.query.carrier ?? "auto";
 
       if (carrier === "all") {
-        return runAll(waybill, lang);
+        const results = await runAll(waybill, lang);
+        return sendResult(req, reply, results, true);
       }
       if (carrier !== "auto") {
-        return runOne(carrier as Carrier, waybill, lang, reply);
+        const single = await runOneOrError(carrier as Carrier, waybill, lang);
+        return sendResult(req, reply, single, false);
       }
       const detected = detectCarrier(waybill);
       if (!detected) {
         // Fall back to querying every carrier in parallel.
-        return runAll(waybill, lang);
+        const results = await runAll(waybill, lang);
+        return sendResult(req, reply, results, true);
       }
-      return runOne(detected, waybill, lang, reply);
+      const single = await runOneOrError(detected, waybill, lang);
+      return sendResult(req, reply, single, false);
     }
   );
 
-  // GET /track/:carrier/:waybill
-  fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string } }>(
+  // GET /track/:carrier/:waybill[?format=text&pretty=1]
+  fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string; format?: string; pretty?: string } }>(
     "/track/:carrier/:waybill",
     {
       schema: {
@@ -214,26 +217,61 @@ async function start() {
         },
         querystring: {
           type: "object",
-          properties: { lang: { type: "string" } },
+          properties: {
+            lang: { type: "string" },
+            format: { type: "string", enum: ["json", "text"] },
+            pretty: { type: "string" },
+          },
         },
-        response: { 200: trackResultSchema },
       },
     },
     async (req, reply) => {
       const { carrier, waybill } = req.params;
       const lang = req.query.lang;
-      return runOne(carrier as Carrier, waybill, lang, reply);
+      const single = await runOneOrError(carrier as Carrier, waybill, lang);
+      return sendResult(req, reply, single, false);
     }
   );
 
-  async function runOne(
+  /** Render either JSON (default) or text depending on the request. */
+  function sendResult(
+    req: import("fastify").FastifyRequest,
+    reply: import("fastify").FastifyReply,
+    payload: TrackResult | MultiTrackResult[] | { error: string; carrier?: string; captchaRequired?: boolean; statusCode: number },
+    isArray: boolean
+  ) {
+    // Error envelope
+    if (!Array.isArray(payload) && "error" in payload && "statusCode" in payload) {
+      const { statusCode, ...rest } = payload;
+      if (wantsText(req)) {
+        reply.code(statusCode).type("text/plain; charset=utf-8");
+        return `Error: ${rest.error}${rest.captchaRequired ? "\n(CAPTCHA required)" : ""}\n`;
+      }
+      reply.code(statusCode).type("application/json; charset=utf-8");
+      return wantsPretty(req) ? JSON.stringify(rest, null, 2) : rest;
+    }
+
+    if (wantsText(req)) {
+      reply.type("text/plain; charset=utf-8");
+      if (isArray) return formatMultipleAsText(payload as MultiTrackResult[]);
+      return formatTrackResultAsText(payload as TrackResult);
+    }
+
+    if (wantsPretty(req)) {
+      reply.type("application/json; charset=utf-8");
+      return JSON.stringify(payload, null, 2);
+    }
+    return payload;
+  }
+
+  /** Run one carrier and convert errors into a structured payload (no Fastify reply side-effects). */
+  async function runOneOrError(
     carrier: Carrier,
     waybill: string,
-    lang: string | undefined,
-    reply: import("fastify").FastifyReply
-  ): Promise<TrackResult | undefined> {
+    lang: string | undefined
+  ): Promise<TrackResult | { error: string; carrier?: string; captchaRequired?: boolean; statusCode: number }> {
     if (!ALL_CARRIERS.includes(carrier)) {
-      return reply.code(400).send({ error: `Unknown carrier ${carrier}` });
+      return { error: `Unknown carrier ${carrier}`, statusCode: 400 };
     }
     try {
       switch (carrier) {
@@ -248,15 +286,15 @@ async function start() {
       }
     } catch (err) {
       if (err instanceof CarrierError) {
-        const code = err.captchaRequired ? 402 : err.statusCode;
-        return reply.code(code).send({
+        return {
           error: err.message,
           carrier: err.carrier,
           captchaRequired: err.captchaRequired,
-        });
+          statusCode: err.captchaRequired ? 402 : err.statusCode,
+        };
       }
       fastify.log.error(err);
-      return reply.code(500).send({ error: (err as Error).message });
+      return { error: (err as Error).message, statusCode: 500 };
     }
   }
 
