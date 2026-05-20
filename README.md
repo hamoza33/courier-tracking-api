@@ -20,7 +20,7 @@ A live OpenAPI / Swagger UI is served at **`/docs`**.
 
 ## Endpoints
 
-### `GET /track?waybill={no}[&carrier={code}][&lang=en]`
+### `GET /track?waybill={no}[&carrier={code}][&lang=en][&format=text][&pretty=1]`
 
 Returns the tracking events for a single waybill.
 
@@ -29,6 +29,11 @@ Returns the tracking events for a single waybill.
   (the default). Set to `all` to fan out to every carrier in parallel.
 - `lang` (optional) – language hint for carriers that support it
   (`en`, `ar`, `zh-CN`).
+- `format` (optional) – `json` (default) or `text`. With `text`, the
+  response is a human-readable timeline with one line per event
+  (just like the courier websites show). You can also send
+  `Accept: text/plain` to get the same effect.
+- `pretty` (optional) – set to `1` to pretty-print JSON output.
 
 The carrier is auto-detected when omitted:
 
@@ -151,12 +156,43 @@ fine. The endpoint to look at in DevTools is
 
 ## Examples
 
-### Auto-detect
+### Auto-detect (JSON)
 
 ```bash
 curl -s https://courier-tracking-api.fly.dev/track?waybill=6050926815554 | jq
 curl -s https://courier-tracking-api.fly.dev/track?waybill=JDW101107292775 | jq
 curl -s https://courier-tracking-api.fly.dev/track?waybill=INJAZ78226736 | jq
+```
+
+### Plain-text timeline
+
+Same endpoint, `?format=text` gives a human-readable timeline (one line per
+event, like the courier websites):
+
+```bash
+curl -s "https://courier-tracking-api.fly.dev/track/imile/6050926815554?format=text"
+```
+
+Sample output:
+
+```
+Carrier:       iMile (imile)
+Waybill:       6050926815554
+Latest status: Delivered
+Latest time:   2026-05-10 11:51:47
+
+Timeline (most recent first):
+────────────────────────────────────────────────────────────────────────
+1. [2026-05-10 11:51:47] Delivered @ Buraidah Station
+   Your order has been delivered successfully.
+
+2. [2026-05-10 08:43:26] Delivery @ Buraidah Station
+   Our delivery associate is out for delivery.
+
+3. [2026-05-09 19:07:51] Pick Up @ Riyadh Collection Station
+   Your order has been picked up.
+
+...
 ```
 
 ### Force carrier
@@ -172,6 +208,7 @@ curl -s https://courier-tracking-api.fly.dev/track/jt/JTE000944462953 | jq
 
 ```bash
 curl -s "https://courier-tracking-api.fly.dev/track?waybill=6050926815554&carrier=all" | jq
+curl -s "https://courier-tracking-api.fly.dev/track?waybill=6050926815554&carrier=all&format=text"
 ```
 
 ---
