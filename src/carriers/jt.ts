@@ -3,14 +3,13 @@ import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
 const JT_BASE = "https://ofmg.jtjms-sa.com";
 const JT_REFERER = "https://www.jtexpress.me/";
 /**
- * Tencent Captcha "aid" value used by J&T's KSA website (it appears in the URL
- * `https://t.captcha.qq.com/cap_union_prehandle?aid=...`). The aid is a string
- * of digits identifying the captcha tenant; for J&T Middle East it is
- * `2032099822` (captured from the live site).
+ * Tencent Captcha appKey / "aid" used by J&T's KSA website. Captured from the
+ * live captcha widget URL:
+ *   `https://ca.turing.captcha.qcloud.com/cap_union_prehandle?aid=189943813&...`
  *
- * If captcha is ever rotated, override via the `JT_TENCENT_CAPTCHA_AID` env var.
+ * If J&T ever rotates it, override via the `JT_TENCENT_CAPTCHA_AID` env var.
  */
-const JT_TENCENT_CAPTCHA_AID = process.env.JT_TENCENT_CAPTCHA_AID || "2032099822";
+const JT_TENCENT_CAPTCHA_AID = process.env.JT_TENCENT_CAPTCHA_AID || "189943813";
 
 const JT_LANG_MAP: Record<string, string> = {
   en: "EN",
@@ -73,7 +72,10 @@ async function solveTencentCaptchaWith2Captcha(): Promise<CaptchaSolution> {
   inUrl.searchParams.set("key", key);
   inUrl.searchParams.set("method", "tencent");
   inUrl.searchParams.set("app_id", JT_TENCENT_CAPTCHA_AID);
-  inUrl.searchParams.set("pageurl", JT_REFERER);
+  inUrl.searchParams.set(
+    "pageurl",
+    "https://www.jtexpress.me/KSA/trajectoryQuery"
+  );
   inUrl.searchParams.set("json", "1");
 
   const submit = await fetch(inUrl.toString(), { method: "GET" });
