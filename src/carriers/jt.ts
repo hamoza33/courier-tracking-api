@@ -54,41 +54,106 @@ interface JtOptions {
   lang?: string;
 }
 
+/** Common error helper. */
+function captchaError(msg: string, statusCode = 502): never {
+  throw new CarrierError("jt", msg, { statusCode, captchaRequired: true });
+}
+
 /**
- * Attempt to resolve a Tencent (TJN) captcha via the 2Captcha service.
- * Documented at https://2captcha.com/2captcha-api#tencent
+ * Solve J&T's Tencent (Turing / TJN) captcha via CapSolver.
+ * Docs: https://docs.capsolver.com/guide/captcha/Tencent.html
+ *
+ * The Turing variant uses task type `AntiTurnstileTaskProxyless` for some
+ * Tencent widgets but TJN puzzles are best targeted with
+ * `AntiTencentCaptchaTaskProxyLess` (note casing). CapSolver accepts a few
+ * aliases; we use the documented one.
  */
-async function solveTencentCaptchaWith2Captcha(): Promise<CaptchaSolution> {
-  const key = process.env.TWOCAPTCHA_API_KEY;
-  if (!key) {
-    throw new CarrierError(
-      "jt",
-      "J&T Express requires solving a Tencent CAPTCHA. Set TWOCAPTCHA_API_KEY (or use one of the alternative providers) to enable automatic solving.",
-      { statusCode: 502, captchaRequired: true }
+async function solveTencentWithCapSolver(): Promise<CaptchaSolution> {
+  const key = process.env.CAPSOLVER_API_KEY;
+  if (!key) throw new Error("CAPSOLVER_API_KEY not set");
+
+  const createBody = {
+    clientKey: key,
+    task: {
+      type: "AntiTencentCaptchaTaskProxyLess",
+      websiteURL: "https://www.jtexpress.me/KSA/trajectoryQuery",
+      appId: JT_TENCENT_CAPTCHA_AID,
+    },
+  };
+
+  const create = await fetch("https://api.capsolver.com/createTask", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(createBody),
+  });
+  const cj = (await create.json()) as {
+    errorId: number;
+    errorCode?: string;
+    errorDescription?: string;
+    taskId?: string;
+  };
+  if (cj.errorId !== 0 || !cj.taskId) {
+    captchaError(
+      `CapSolver createTask failed: ${cj.errorCode ?? ""} ${cj.errorDescription ?? JSON.stringify(cj)}`
     );
   }
+
+  const start = Date.now();
+  const maxMs = 120_000;
+  await sleep(3000);
+  while (Date.now() - start < maxMs) {
+    const r = await fetch("https://api.capsolver.com/getTaskResult", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientKey: key, taskId: cj.taskId! }),
+    });
+    const rj = (await r.json()) as {
+      errorId: number;
+      errorCode?: string;
+      errorDescription?: string;
+      status: "idle" | "ready" | "processing" | "failed";
+      solution?: { ticket?: string; randstr?: string; appid?: string };
+    };
+    if (rj.errorId !== 0) {
+      captchaError(`CapSolver getTaskResult failed: ${rj.errorCode ?? ""} ${rj.errorDescription ?? ""}`);
+    }
+    if (rj.status === "ready" && rj.solution?.ticket && rj.solution.randstr) {
+      return { ticket: rj.solution.ticket, randstr: rj.solution.randstr };
+    }
+    if (rj.status === "failed") {
+      captchaError(`CapSolver reported task failed: ${rj.errorDescription ?? ""}`);
+    }
+    await sleep(3000);
+  }
+  captchaError("CapSolver timed out solving Tencent CAPTCHA after 120s", 504);
+}
+
+/**
+ * Solve J&T's captcha via 2Captcha (`method=tencent`).
+ * Docs: https://2captcha.com/2captcha-api#tencent
+ *
+ * Note: 2Captcha's tencent solver is reliable for the classic Tencent widget
+ * but has poor success rates against J&T's newer Turing (TJN) variant — kept
+ * here only as a fallback.
+ */
+async function solveTencentWith2Captcha(): Promise<CaptchaSolution> {
+  const key = process.env.TWOCAPTCHA_API_KEY;
+  if (!key) throw new Error("TWOCAPTCHA_API_KEY not set");
 
   const inUrl = new URL("https://2captcha.com/in.php");
   inUrl.searchParams.set("key", key);
   inUrl.searchParams.set("method", "tencent");
   inUrl.searchParams.set("app_id", JT_TENCENT_CAPTCHA_AID);
-  inUrl.searchParams.set(
-    "pageurl",
-    "https://www.jtexpress.me/KSA/trajectoryQuery"
-  );
+  inUrl.searchParams.set("pageurl", "https://www.jtexpress.me/KSA/trajectoryQuery");
   inUrl.searchParams.set("json", "1");
 
   const submit = await fetch(inUrl.toString(), { method: "GET" });
   const submitJson = (await submit.json()) as { status: number; request: string };
   if (submitJson.status !== 1) {
-    throw new CarrierError("jt", `2Captcha submission failed: ${submitJson.request}`, {
-      statusCode: 502,
-      captchaRequired: true,
-    });
+    captchaError(`2Captcha submission failed: ${submitJson.request}`);
   }
   const captchaId = submitJson.request;
 
-  // Poll for solution (Tencent jobs typically resolve in ~20-40s).
   const resUrl = new URL("https://2captcha.com/res.php");
   resUrl.searchParams.set("key", key);
   resUrl.searchParams.set("action", "get");
@@ -97,31 +162,52 @@ async function solveTencentCaptchaWith2Captcha(): Promise<CaptchaSolution> {
 
   const start = Date.now();
   const maxMs = 120_000;
-  // 5s initial delay, then poll every 5s.
   await sleep(5000);
   while (Date.now() - start < maxMs) {
     const r = await fetch(resUrl.toString(), { method: "GET" });
     const rj = (await r.json()) as { status: number; request: string };
     if (rj.status === 1) {
-      // 2Captcha returns `ticket|randstr` for Tencent puzzles.
       const [ticket, randstr] = rj.request.split("|");
       if (!ticket || !randstr) {
-        throw new CarrierError("jt", `2Captcha returned malformed solution: ${rj.request}`, {
-          captchaRequired: true,
-        });
+        captchaError(`2Captcha returned malformed solution: ${rj.request}`);
       }
       return { ticket, randstr };
     }
     if (rj.request !== "CAPCHA_NOT_READY") {
-      throw new CarrierError("jt", `2Captcha returned error: ${rj.request}`, {
-        statusCode: 502,
-        captchaRequired: true,
-      });
+      captchaError(`2Captcha returned error: ${rj.request}`);
     }
     await sleep(5000);
   }
-  throw new CarrierError("jt", "2Captcha timed out solving Tencent CAPTCHA after 120s", {
-    statusCode: 504,
+  captchaError("2Captcha timed out solving Tencent CAPTCHA after 120s", 504);
+}
+
+/**
+ * Try every configured captcha provider in order of reliability for Tencent
+ * Turing (TJN). Returns the first success, or aggregates errors if all fail.
+ */
+async function solveTencentCaptcha(): Promise<CaptchaSolution> {
+  const providers: Array<{ name: string; fn: () => Promise<CaptchaSolution> }> = [];
+  if (process.env.CAPSOLVER_API_KEY) providers.push({ name: "CapSolver", fn: solveTencentWithCapSolver });
+  if (process.env.TWOCAPTCHA_API_KEY) providers.push({ name: "2Captcha", fn: solveTencentWith2Captcha });
+
+  if (providers.length === 0) {
+    throw new CarrierError(
+      "jt",
+      "J&T Express requires solving a Tencent CAPTCHA. Set CAPSOLVER_API_KEY (recommended) or TWOCAPTCHA_API_KEY to enable automatic solving.",
+      { statusCode: 502, captchaRequired: true }
+    );
+  }
+
+  const errors: string[] = [];
+  for (const p of providers) {
+    try {
+      return await p.fn();
+    } catch (err) {
+      errors.push(`${p.name}: ${(err as Error).message}`);
+    }
+  }
+  throw new CarrierError("jt", `All captcha providers failed: ${errors.join(" | ")}`, {
+    statusCode: 502,
     captchaRequired: true,
   });
 }
@@ -164,7 +250,7 @@ export async function trackJt(waybillNo: string, opts: JtOptions = {}): Promise<
   const langType = JT_LANG_MAP[(opts.lang ?? "en").toLowerCase()] ?? "EN";
 
   // Resolve captcha first (or fail fast if not configured).
-  const solution = await solveTencentCaptchaWith2Captcha();
+  const solution = await solveTencentCaptcha();
 
   const body = JSON.stringify({
     waybillNo: [wb],

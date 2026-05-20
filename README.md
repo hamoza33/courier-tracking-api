@@ -124,25 +124,39 @@ For automation, the cleanest options for solving Tencent TJN captchas are:
 | **Anti-Captcha** | `TencentTask`          | Reliable, supports proxy.                                         |
 | **NopeCHA**  | `tencent`                  | Browser-extension friendly.                                       |
 
-This project ships with a **2Captcha integration**. To enable real J&T
-tracking, export:
+This project ships with **two captcha integrations**: CapSolver (preferred)
+and 2Captcha (fallback). To enable real J&T tracking, set one (or both):
 
 ```bash
+# Preferred — best for the Turing (TJN) variant J&T uses.
+export CAPSOLVER_API_KEY=your_capsolver_key
+
+# Optional fallback — 2Captcha's tencent solver has poor success against TJN
+# but works for the classic Tencent widget.
 export TWOCAPTCHA_API_KEY=your_2captcha_key
+
 # Optional – override the Tencent "aid" if J&T rotates it:
-# export JT_TENCENT_CAPTCHA_AID=2032099822
+# export JT_TENCENT_CAPTCHA_AID=189943813
 ```
 
-With `TWOCAPTCHA_API_KEY` set, the `/track/jt/...` endpoint will:
+The `/track/jt/...` endpoint tries providers in order (CapSolver → 2Captcha),
+returning the first success. It will:
 
-1. Submit a Tencent puzzle job to 2Captcha (`method=tencent`).
-2. Poll until a `ticket|randstr` pair comes back (~20-40 s typically).
+1. Submit a Tencent puzzle job (`AntiTencentCaptchaTaskProxyLess` on
+   CapSolver / `method=tencent` on 2Captcha).
+2. Poll until a `ticket / randstr` pair comes back (~10-30 s on CapSolver,
+   ~20-40 s on 2Captcha).
 3. Call `https://ofmg.jtjms-sa.com/official/express/getDetailByWaybillNo`
    with the ticket in both the body and the `token` header.
 
-If `TWOCAPTCHA_API_KEY` is **not** set, the J&T endpoint returns
-`402 Payment Required` with `{"captchaRequired": true}` – every other carrier
-keeps working.
+If neither key is set, the J&T endpoint returns `402 Payment Required` with
+`{"captchaRequired": true}` – every other carrier keeps working.
+
+**Why CapSolver over 2Captcha for J&T?** J&T uses Tencent's *Turing* (TJN)
+captcha variant served from `turing.captcha.qcloud.com`. 2Captcha's
+`method=tencent` solvers struggle with the Turing puzzles (most jobs return
+`ERROR_CAPTCHA_UNSOLVABLE`), while CapSolver has a dedicated task type for
+it with ~95% success.
 
 ### Manual / interactive option
 
@@ -231,8 +245,9 @@ npm run build && npm start
 | `LOG_LEVEL`                  | `info`                        | Pino log level                                |
 | `RATE_LIMIT_MAX`             | `60`                          | Requests per window per IP                    |
 | `RATE_LIMIT_WINDOW`          | `1 minute`                    | Rate-limit window                             |
-| `TWOCAPTCHA_API_KEY`         | _(unset)_                     | Enables J&T captcha solving via 2Captcha      |
-| `JT_TENCENT_CAPTCHA_AID`     | `2032099822`                  | Override Tencent captcha tenant ID            |
+| `CAPSOLVER_API_KEY`          | _(unset)_                     | Enables J&T captcha solving via CapSolver (recommended) |
+| `TWOCAPTCHA_API_KEY`         | _(unset)_                     | Enables J&T captcha solving via 2Captcha (fallback) |
+| `JT_TENCENT_CAPTCHA_AID`     | `189943813`                   | Override Tencent captcha tenant ID            |
 
 ---
 
