@@ -16,7 +16,8 @@ function assert(name: string, actual: unknown, expected: unknown): void {
 // --- Delivered ---
 assert("iMile delivered", normalizeStatus("Delivered"), "Delivered");
 assert("iMile delivered AR", normalizeStatus("تم التسليم"), "Delivered");
-assert("J&T sign scan", normalizeStatus("Sign scan"), "Delivered");
+assert("J&T sign scan delivered", normalizeStatus("Sign scan", "Package delivered to recipient"), "Delivered");
+assert("J&T sign scan returned", normalizeStatus("Sign scan", "The Shipment has been returned to the sender!"), "Returned");
 assert("J&T signed", normalizeStatus("Returned signed"), "Returned");
 assert("JDW delivered", normalizeStatus("Delivered"), "Delivered");
 assert("Naqel delivered", normalizeStatus("Delivered"), "Delivered");

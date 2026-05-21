@@ -19,6 +19,24 @@ export function normalizeStatus(
   const text = ((status || description) ?? "").toLowerCase().trim();
   if (!text) return null;
 
+  // Also check description for context clues (e.g. status="Sign scan" but desc="returned to sender")
+  const descLower = (description ?? "").toLowerCase();
+
+  // Returned — check first because description may override status
+  // e.g. J&T status="Sign scan" but description="returned to sender"
+  if (
+    text.includes("return") ||
+    text.includes("rto") ||
+    text.includes("returned to") ||
+    text.includes("shipment returned") ||
+    text.includes("returned signed") ||
+    descLower.includes("returned to the sender") ||
+    descLower.includes("returned to sender") ||
+    descLower.includes("being returned")
+  ) {
+    return "Returned";
+  }
+
   // Delivered
   if (
     text.includes("delivered") ||
@@ -27,20 +45,9 @@ export function normalizeStatus(
     text === "sign scan"
   ) {
     // Exclude "delivery attempted" — that's not delivered
-    if (!text.includes("attempted") && !text.includes("failed") && !text.includes("return")) {
+    if (!text.includes("attempted") && !text.includes("failed")) {
       return "Delivered";
     }
-  }
-
-  // Returned — check before Out for Delivery since "returned" might contain "delivery"
-  if (
-    text.includes("return") ||
-    text.includes("rto") ||
-    text.includes("returned to") ||
-    text.includes("shipment returned") ||
-    text.includes("returned signed")
-  ) {
-    return "Returned";
   }
 
   // Out for Delivery
