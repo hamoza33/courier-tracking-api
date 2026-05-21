@@ -9,8 +9,14 @@ import { trackImile } from "./carriers/imile.js";
 import { trackInjaz } from "./carriers/injaz.js";
 import { trackJt } from "./carriers/jt.js";
 import { trackJdw } from "./carriers/jdw.js";
+import { trackNaqel } from "./carriers/naqel.js";
 import { CarrierError, type Carrier, type TrackResult } from "./types.js";
-import { formatMultipleAsText, formatTrackResultAsText } from "./format.js";
+import {
+  formatMultipleAsText,
+  formatTrackResultAsText,
+  normalizeForJson,
+  type FormatOptions,
+} from "./format.js";
 
 type MultiTrackResult = { carrier: string; result?: TrackResult; error?: { message: string; captchaRequired?: boolean } };
 
@@ -27,6 +33,18 @@ function wantsPretty(req: import("fastify").FastifyRequest): boolean {
   const q = req.query as Record<string, string | undefined> | undefined;
   const v = (q?.pretty ?? "").toLowerCase();
   return v === "1" || v === "true" || v === "yes";
+}
+
+/**
+ * Determine ordering preference. Default is "asc" (earliest → most recent),
+ * which matches how courier websites typically render their timelines and
+ * what users requested. Pass `?order=desc` to flip it.
+ */
+function orderOf(req: import("fastify").FastifyRequest): "asc" | "desc" {
+  const q = req.query as Record<string, string | undefined> | undefined;
+  const v = (q?.order ?? "").toLowerCase();
+  if (v === "desc" || v === "newest" || v === "reverse") return "desc";
+  return "asc";
 }
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -103,6 +121,13 @@ async function start() {
         carriers: "GET /carriers",
         health: "GET /health",
       },
+      queryParams: {
+        format: "'json' (default) or 'text' — text returns a step-by-step plain-text timeline.",
+        order: "'asc' (default, earliest → most recent) or 'desc' to reverse.",
+        pretty: "'1' for pretty-printed JSON.",
+        lang: "Optional language hint, e.g. en, ar.",
+        carrier: "On /track: force a carrier (imile|injaz|jdw|naqel|jt) or 'all'.",
+      },
     })
   );
 
@@ -136,15 +161,16 @@ async function start() {
     async () => [
       { code: "imile", name: "iMile", captchaRequired: false },
       { code: "injaz", name: "Injaz Express", captchaRequired: false },
-      { code: "jt", name: "J&T Express", captchaRequired: true },
       { code: "jdw", name: "JDW Logistics (JINGDONG)", captchaRequired: false },
+      { code: "naqel", name: "Naqel Express", captchaRequired: false },
+      { code: "jt", name: "J&T Express", captchaRequired: true },
     ]
   );
 
   // ----- tracking endpoints -----
 
-  // GET /track?waybill=...&lang=en[&carrier=imile][&format=text][&pretty=1]
-  fastify.get<{ Querystring: { waybill?: string; lang?: string; carrier?: string; format?: string; pretty?: string } }>(
+  // GET /track?waybill=...&lang=en[&carrier=imile][&format=text][&pretty=1][&order=asc]
+  fastify.get<{ Querystring: { waybill?: string; lang?: string; carrier?: string; format?: string; pretty?: string; order?: string } }>(
     "/track",
     {
       schema: {
@@ -158,7 +184,7 @@ async function start() {
             lang: { type: "string", description: "Language preference (e.g. en, ar)" },
             carrier: {
               type: "string",
-              enum: ["imile", "injaz", "jt", "jdw", "auto", "all"],
+              enum: ["imile", "injaz", "jt", "jdw", "naqel", "auto", "all"],
               description: "Force a specific carrier, or 'all' to query every carrier in parallel",
             },
             format: {
@@ -169,6 +195,11 @@ async function start() {
             pretty: {
               type: "string",
               description: "Set to '1' to pretty-print JSON output.",
+            },
+            order: {
+              type: "string",
+              enum: ["asc", "desc"],
+              description: "Event order. Default 'asc' (earliest → most recent).",
             },
           },
         },
@@ -200,8 +231,8 @@ async function start() {
     }
   );
 
-  // GET /track/:carrier/:waybill[?format=text&pretty=1]
-  fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string; format?: string; pretty?: string } }>(
+  // GET /track/:carrier/:waybill[?format=text&pretty=1&order=asc]
+  fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string; format?: string; pretty?: string; order?: string } }>(
     "/track/:carrier/:waybill",
     {
       schema: {
@@ -210,7 +241,7 @@ async function start() {
         params: {
           type: "object",
           properties: {
-            carrier: { type: "string", enum: ["imile", "injaz", "jt", "jdw"] },
+            carrier: { type: "string", enum: ["imile", "injaz", "jt", "jdw", "naqel"] },
             waybill: { type: "string" },
           },
           required: ["carrier", "waybill"],
@@ -221,6 +252,7 @@ async function start() {
             lang: { type: "string" },
             format: { type: "string", enum: ["json", "text"] },
             pretty: { type: "string" },
+            order: { type: "string", enum: ["asc", "desc"] },
           },
         },
       },
@@ -240,6 +272,9 @@ async function start() {
     payload: TrackResult | MultiTrackResult[] | { error: string; carrier?: string; captchaRequired?: boolean; statusCode: number },
     isArray: boolean
   ) {
+    const order = orderOf(req);
+    const fmtOpts: FormatOptions = { order };
+
     // Error envelope
     if (!Array.isArray(payload) && "error" in payload && "statusCode" in payload) {
       const { statusCode, ...rest } = payload;
@@ -253,15 +288,28 @@ async function start() {
 
     if (wantsText(req)) {
       reply.type("text/plain; charset=utf-8");
-      if (isArray) return formatMultipleAsText(payload as MultiTrackResult[]);
-      return formatTrackResultAsText(payload as TrackResult);
+      if (isArray) return formatMultipleAsText(payload as MultiTrackResult[], fmtOpts);
+      return formatTrackResultAsText(payload as TrackResult, fmtOpts);
+    }
+
+    // JSON: always normalize so the events array is step-by-step (with the
+    // carrier name attached to each event) and in chronological order.
+    let jsonPayload: unknown;
+    if (isArray) {
+      jsonPayload = (payload as MultiTrackResult[]).map((m) =>
+        m.result
+          ? { carrier: m.carrier, result: normalizeForJson(m.result, fmtOpts) }
+          : { carrier: m.carrier, error: m.error }
+      );
+    } else {
+      jsonPayload = normalizeForJson(payload as TrackResult, fmtOpts);
     }
 
     if (wantsPretty(req)) {
       reply.type("application/json; charset=utf-8");
-      return JSON.stringify(payload, null, 2);
+      return JSON.stringify(jsonPayload, null, 2);
     }
-    return payload;
+    return jsonPayload;
   }
 
   /** Run one carrier and convert errors into a structured payload (no Fastify reply side-effects). */
@@ -283,6 +331,8 @@ async function start() {
           return await trackJt(waybill, { lang });
         case "jdw":
           return await trackJdw(waybill, lang);
+        case "naqel":
+          return await trackNaqel(waybill);
       }
     } catch (err) {
       if (err instanceof CarrierError) {
@@ -320,6 +370,8 @@ async function start() {
           return { result: await trackJt(waybill, { lang }) };
         case "jdw":
           return { result: await trackJdw(waybill, lang) };
+        case "naqel":
+          return { result: await trackNaqel(waybill) };
       }
     } catch (err) {
       if (err instanceof CarrierError) {

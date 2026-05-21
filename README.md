@@ -1,38 +1,45 @@
 # Courier Tracking Aggregator API
 
 A small Node.js/TypeScript REST API that aggregates shipment tracking from
-four Middle-East courier services:
+five Middle-East / global courier services:
 
 | Code     | Carrier                     | CAPTCHA?                     |
 | -------- | --------------------------- | ---------------------------- |
 | `imile`  | iMile                       | No                           |
 | `injaz`  | Injaz Express               | No                           |
-| `jt`     | J&T Express                 | **Yes – Tencent TJN Captcha**|
 | `jdw`    | JDW Logistics (JINGDONG)    | No                           |
+| `naqel`  | Naqel Express               | No                           |
+| `jt`     | J&T Express                 | **Yes – Tencent TJN Captcha**|
 
 The API exposes a single unified `/track` endpoint that can either auto-detect
-the carrier from the waybill number, or use a carrier you specify. Responses
-are normalised across carriers (`events[]`, `latestStatus`, `latestTime`).
+the carrier from the waybill number or use a carrier you specify. Responses
+are normalised across carriers (`events[]`, `latestStatus`, `latestTime`) with
+each event already split into a discrete object (step + timestamp + status +
+description + location + carrier name).
 
 A live OpenAPI / Swagger UI is served at **`/docs`**.
+
+**Live deployment:** https://courier-tracking-api.fly.dev
 
 ---
 
 ## Endpoints
 
-### `GET /track?waybill={no}[&carrier={code}][&lang=en][&format=text][&pretty=1]`
+### `GET /track?waybill={no}[&carrier={code}][&lang=en][&format=text][&pretty=1][&order=asc]`
 
 Returns the tracking events for a single waybill.
 
 - `waybill` (required) – the tracking number.
-- `carrier` (optional) – one of `imile`, `injaz`, `jt`, `jdw`, or `auto`
-  (the default). Set to `all` to fan out to every carrier in parallel.
+- `carrier` (optional) – one of `imile`, `injaz`, `jdw`, `naqel`, `jt`, or
+  `auto` (the default). Set to `all` to fan out to every carrier in parallel.
 - `lang` (optional) – language hint for carriers that support it
   (`en`, `ar`, `zh-CN`).
 - `format` (optional) – `json` (default) or `text`. With `text`, the
   response is a human-readable timeline with one line per event
   (just like the courier websites show). You can also send
   `Accept: text/plain` to get the same effect.
+- `order` (optional) – `asc` (default, earliest → most recent) or `desc`
+  to reverse.
 - `pretty` (optional) – set to `1` to pretty-print JSON output.
 
 The carrier is auto-detected when omitted:
@@ -43,11 +50,12 @@ The carrier is auto-detected when omitted:
 | `^JDW\d{6,16}$`            | `jdw`   |
 | `^INJAZ[A-Z0-9]{4,16}$`    | `injaz` |
 | `^\d{10,16}$` (digits)     | `imile` |
+| `^\d{7,10}$` (short digits)| `naqel` |
 
-If detection fails the API automatically fans out to all four carriers
-and returns an array.
+If detection fails the API automatically fans out to every carrier and
+returns an array.
 
-### `GET /track/{carrier}/{waybill}[?lang=en]`
+### `GET /track/{carrier}/{waybill}[?lang=en&format=text&order=asc]`
 
 Same as above but with the carrier as a path parameter. Useful when you
 already know which courier the shipment belongs to.
@@ -68,6 +76,10 @@ Interactive Swagger UI.
 
 ## Response shape
 
+Every event is returned as its own object — easy to iterate over from
+JavaScript (`results.events.map(...)`), Python, etc. Each event carries the
+carrier name so individual rows can be displayed standalone.
+
 ```jsonc
 {
   "carrier": "imile",
@@ -78,13 +90,26 @@ Interactive Swagger UI.
   "latestTime": "2026-05-10 11:51:47",
   "events": [
     {
-      "time": "2026-05-10 11:51:47",
-      "status": "Delivered",
-      "description": "Your order has been delivered successfully.",
+      "step": 1,
+      "time": "2026-05-09 19:07:51",
+      "status": "Pick Up",
+      "description": "Your order has been picked up.",
+      "location": "Riyadh Collection Station",
+      "timezone": null,
+      "carrier": "imile",
+      "carrierName": "iMile"
+    },
+    {
+      "step": 2,
+      "time": "2026-05-10 08:43:26",
+      "status": "Delivery",
+      "description": "Our delivery associate is out for delivery.",
       "location": "Buraidah Station",
-      "timezone": null
+      "timezone": null,
+      "carrier": "imile",
+      "carrierName": "iMile"
     }
-    /* ... oldest events follow, most recent first ... */
+    /* ... more events, oldest -> newest ... */
   ],
   "extra": {
     "sendSite": "Riyadh Collection Station",
@@ -104,84 +129,110 @@ to solve a captcha".
 
 ---
 
-## CAPTCHA handling (J&T Express)
+## Using the API from your website
 
-J&T Express's KSA / Middle-East website (`jtexpress.me`) protects its tracking
-API with **Tencent Cloud (TJN) Captcha** – the same widget Tencent uses for
-QQ logins. The captcha runs *before* the tracking call, and the returned
-`ticket` is sent back in the `token` HTTP header (and `ticket` / `randstr`
-fields in the body). Without a valid ticket the API responds with
-`{"code":135010037,"msg":"token不能为空"}`.
+CORS is enabled (`Access-Control-Allow-Origin: *`), so you can call this API
+directly from a browser without a proxy.
 
-### Recommended tools
+### Plain JavaScript (`fetch`)
 
-For automation, the cleanest options for solving Tencent TJN captchas are:
+```html
+<script>
+async function track(waybill) {
+  const res = await fetch(
+    `https://courier-tracking-api.fly.dev/track?waybill=${encodeURIComponent(waybill)}`
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `HTTP ${res.status}`);
+  }
+  return res.json(); // -> { carrier, carrierName, waybillNo, events: [...], ... }
+}
 
-| Provider     | Method name                | Notes                                                             |
-| ------------ | -------------------------- | ----------------------------------------------------------------- |
-| **2Captcha** | `method=tencent`           | Cheapest (~$1 / 1000 solves). Used by this project by default.    |
-| **CapSolver**| `TencentCaptchaTaskProxyless` | Generally fastest. SDKs for Node / Python.                     |
-| **Anti-Captcha** | `TencentTask`          | Reliable, supports proxy.                                         |
-| **NopeCHA**  | `tencent`                  | Browser-extension friendly.                                       |
-
-This project ships with **two captcha integrations**: CapSolver (preferred)
-and 2Captcha (fallback). To enable real J&T tracking, set one (or both):
-
-```bash
-# Preferred — best for the Turing (TJN) variant J&T uses.
-export CAPSOLVER_API_KEY=your_capsolver_key
-
-# Optional fallback — 2Captcha's tencent solver has poor success against TJN
-# but works for the classic Tencent widget.
-export TWOCAPTCHA_API_KEY=your_2captcha_key
-
-# Optional – override the Tencent "aid" if J&T rotates it:
-# export JT_TENCENT_CAPTCHA_AID=189943813
+track("6050926815554").then((data) => {
+  // Render step-by-step:
+  for (const e of data.events) {
+    console.log(
+      `[${e.time}] ${e.status} @ ${e.location ?? "-"}  — ${e.carrierName}`
+    );
+  }
+});
+</script>
 ```
 
-The `/track/jt/...` endpoint tries providers in order (CapSolver → 2Captcha),
-returning the first success. It will:
+### React
 
-1. Submit a Tencent puzzle job (`AntiTencentCaptchaTaskProxyLess` on
-   CapSolver / `method=tencent` on 2Captcha).
-2. Poll until a `ticket / randstr` pair comes back (~10-30 s on CapSolver,
-   ~20-40 s on 2Captcha).
-3. Call `https://ofmg.jtjms-sa.com/official/express/getDetailByWaybillNo`
-   with the ticket in both the body and the `token` header.
+```jsx
+import { useEffect, useState } from "react";
 
-If neither key is set, the J&T endpoint returns `402 Payment Required` with
-`{"captchaRequired": true}` – every other carrier keeps working.
+function Tracking({ waybill }) {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
 
-**Why CapSolver over 2Captcha for J&T?** J&T uses Tencent's *Turing* (TJN)
-captcha variant served from `turing.captcha.qcloud.com`. 2Captcha's
-`method=tencent` solvers struggle with the Turing puzzles (most jobs return
-`ERROR_CAPTCHA_UNSOLVABLE`), while CapSolver has a dedicated task type for
-it with ~95% success.
+  useEffect(() => {
+    fetch(`https://courier-tracking-api.fly.dev/track?waybill=${waybill}`)
+      .then((r) => r.json())
+      .then(setData)
+      .catch(setErr);
+  }, [waybill]);
 
-### Manual / interactive option
+  if (err) return <p>Error: {err.message}</p>;
+  if (!data) return <p>Loading…</p>;
 
-If you only need to test occasionally, opening
-`https://www.jtexpress.me/KSA/trajectoryQuery?waybillNo=...` in a real
-browser, solving the captcha yourself, and copying the network response is
-fine. The endpoint to look at in DevTools is
-`POST https://ofmg.jtjms-sa.com/official/express/getDetailByWaybillNo`.
+  return (
+    <ol>
+      {data.events.map((e) => (
+        <li key={e.step}>
+          <strong>{e.time}</strong> — {e.status}
+          {e.location ? ` @ ${e.location}` : ""}{" "}
+          <em>({e.carrierName})</em>
+        </li>
+      ))}
+    </ol>
+  );
+}
+```
+
+### axios
+
+```js
+import axios from "axios";
+
+const { data } = await axios.get(
+  "https://courier-tracking-api.fly.dev/track/naqel/397965386"
+);
+for (const e of data.events) {
+  console.log(`${e.step}. [${e.time}] ${e.status} @ ${e.location} — ${e.carrierName}`);
+}
+```
+
+### Force a specific carrier
+
+```js
+await fetch("https://courier-tracking-api.fly.dev/track/imile/6050926815554");
+await fetch("https://courier-tracking-api.fly.dev/track/injaz/INJAZ78226736");
+await fetch("https://courier-tracking-api.fly.dev/track/jdw/JDW101107292775");
+await fetch("https://courier-tracking-api.fly.dev/track/naqel/397965386");
+```
+
+### Fan-out across every carrier
+
+When you don't know which courier a waybill belongs to, set `carrier=all`:
+
+```js
+const res = await fetch(
+  `https://courier-tracking-api.fly.dev/track?waybill=${waybill}&carrier=all`
+);
+const arr = await res.json(); // -> [{ carrier, result?, error? }, ...]
+const hit = arr.find((x) => x.result?.found);
+```
 
 ---
 
-## Examples
+## Plain-text format
 
-### Auto-detect (JSON)
-
-```bash
-curl -s https://courier-tracking-api.fly.dev/track?waybill=6050926815554 | jq
-curl -s https://courier-tracking-api.fly.dev/track?waybill=JDW101107292775 | jq
-curl -s https://courier-tracking-api.fly.dev/track?waybill=INJAZ78226736 | jq
-```
-
-### Plain-text timeline
-
-Same endpoint, `?format=text` gives a human-readable timeline (one line per
-event, like the courier websites):
+For copy/paste, logs, or chat bots, pass `?format=text` to get a
+step-by-step timeline (one line per event, earliest → most recent):
 
 ```bash
 curl -s "https://courier-tracking-api.fly.dev/track/imile/6050926815554?format=text"
@@ -195,35 +246,61 @@ Waybill:       6050926815554
 Latest status: Delivered
 Latest time:   2026-05-10 11:51:47
 
-Timeline (most recent first):
+Timeline (step-by-step, earliest → most recent) — iMile:
 ────────────────────────────────────────────────────────────────────────
-1. [2026-05-10 11:51:47] Delivered @ Buraidah Station
-   Your order has been delivered successfully.
+1.  [2026-05-09 19:07:51] Pick Up @ Riyadh Collection Station  — iMile
+    Your order has been picked up.
 
-2. [2026-05-10 08:43:26] Delivery @ Buraidah Station
-   Our delivery associate is out for delivery.
+2.  [2026-05-10 08:43:26] Delivery @ Buraidah Station  — iMile
+    Our delivery associate is out for delivery.
 
-3. [2026-05-09 19:07:51] Pick Up @ Riyadh Collection Station
-   Your order has been picked up.
-
-...
+3.  [2026-05-10 11:51:47] Delivered @ Buraidah Station  — iMile
+    Your order has been delivered successfully.
 ```
 
-### Force carrier
+---
+
+## CAPTCHA handling (J&T Express only)
+
+J&T Express's KSA / Middle-East site (`jtexpress.me`) protects its tracking
+API with **Tencent Cloud (TJN) Captcha** – the Turing variant served from
+`turing.captcha.qcloud.com`. The captcha must be solved before the tracking
+call; without a valid ticket the API responds with
+`{"code":135010037,"msg":"token不能为空"}`.
+
+### Recommended tools
+
+| Provider     | Method / task name              | Notes                                                              |
+| ------------ | ------------------------------- | ------------------------------------------------------------------ |
+| **CapSolver**| `AntiTencentCaptchaTaskProxyLess` (image-based, where supported) | Fastest when their TJN solver is available.        |
+| **2Captcha** | `method=tencent`                | Cheap (~$1 / 1000), but their workers struggle with the Turing variant (often returns `ERROR_CAPTCHA_UNSOLVABLE`). |
+| **Anti-Captcha** | `TencentTask`               | Reliable for classic Tencent; for Turing, check their docs.         |
+| **NopeCHA**  | `tencent`                       | Browser-extension friendly.                                         |
+
+To enable real J&T tracking, set one (or both):
 
 ```bash
-curl -s https://courier-tracking-api.fly.dev/track/imile/6050926815554 | jq
-curl -s https://courier-tracking-api.fly.dev/track/jdw/JDW101107292775 | jq
-curl -s https://courier-tracking-api.fly.dev/track/injaz/INJAZ78226736 | jq
-curl -s https://courier-tracking-api.fly.dev/track/jt/JTE000944462953 | jq
+export CAPSOLVER_API_KEY=your_capsolver_key
+export TWOCAPTCHA_API_KEY=your_2captcha_key
+# Optional – override the Tencent "aid" if J&T rotates it:
+# export JT_TENCENT_CAPTCHA_AID=189943813
 ```
 
-### Fan-out
+If neither key is set, the J&T endpoint returns `402 Payment Required` with
+`{"captchaRequired": true}` – every other carrier keeps working.
 
-```bash
-curl -s "https://courier-tracking-api.fly.dev/track?waybill=6050926815554&carrier=all" | jq
-curl -s "https://courier-tracking-api.fly.dev/track?waybill=6050926815554&carrier=all&format=text"
-```
+> **Status:** As of late 2025 the public TJN (Turing) variant J&T uses is
+> hard to automate reliably with off-the-shelf solvers. For consistent
+> tracking we recommend using the API for the other four carriers and
+> falling back to the J&T website manually for the rare J&T waybill.
+
+### Manual / interactive option
+
+For occasional testing, open
+`https://www.jtexpress.me/KSA/trajectoryQuery?waybillNo=...` in a real
+browser, solve the captcha yourself, and copy the network response. The
+endpoint in DevTools is
+`POST https://ofmg.jtjms-sa.com/official/express/getDetailByWaybillNo`.
 
 ---
 
@@ -245,8 +322,8 @@ npm run build && npm start
 | `LOG_LEVEL`                  | `info`                        | Pino log level                                |
 | `RATE_LIMIT_MAX`             | `60`                          | Requests per window per IP                    |
 | `RATE_LIMIT_WINDOW`          | `1 minute`                    | Rate-limit window                             |
-| `CAPSOLVER_API_KEY`          | _(unset)_                     | Enables J&T captcha solving via CapSolver (recommended) |
-| `TWOCAPTCHA_API_KEY`         | _(unset)_                     | Enables J&T captcha solving via 2Captcha (fallback) |
+| `CAPSOLVER_API_KEY`          | _(unset)_                     | Enables J&T captcha solving via CapSolver     |
+| `TWOCAPTCHA_API_KEY`         | _(unset)_                     | Enables J&T captcha solving via 2Captcha      |
 | `JT_TENCENT_CAPTCHA_AID`     | `189943813`                   | Override Tencent captcha tenant ID            |
 
 ---
@@ -259,8 +336,8 @@ The repo ships with a `Dockerfile` and a `fly.toml`. To deploy on
 ```bash
 fly launch --no-deploy   # only the first time
 fly deploy
-# enable J&T captcha solving:
-fly secrets set TWOCAPTCHA_API_KEY=...
+# (optional) enable J&T captcha solving:
+fly secrets set CAPSOLVER_API_KEY=...
 ```
 
 ---
@@ -288,18 +365,30 @@ Plain HTML site. We POST `order=<waybill>` to
 occasionally truncates chunked gzip responses mid-stream, so we explicitly
 request `Accept-Encoding: identity`.
 
-### J&T Express
-
-Tencent CAPTCHA gated. Once a captcha ticket is obtained, we POST to
-`https://ofmg.jtjms-sa.com/official/express/getDetailByWaybillNo` with the
-ticket in the `token` header and `ticket`/`randstr` in the body.
-
 ### JDW Logistics (JINGDONG)
 
 We POST to the public LOP proxy
 `https://lop-proxy.ochama.com/WayBillApi/queryOrderTraceBatchV1`
 with the `LOP-DN: intl-cms-interface.jdl.com` header and a body of the form
 `[{"magicNoList":["JDW..."],"lang":"en","timeZone":"UTC+00:00",...}]`.
+
+### Naqel Express
+
+Django form-based site. We:
+
+1. `GET https://www.naqelexpress.com/en/tracking/` and extract the
+   `csrfmiddlewaretoken` from the HTML form.
+2. `POST https://www.naqelexpress.com/en/sa/tracking/` with
+   `csrfmiddlewaretoken` and `waybills` form fields.
+3. Parse the resulting page, walking each "date pill" header and the
+   following `.col-md-12` event rows (status / location / time) into our
+   normalised event list.
+
+### J&T Express
+
+Tencent CAPTCHA gated. Once a captcha ticket is obtained, we POST to
+`https://ofmg.jtjms-sa.com/official/express/getDetailByWaybillNo` with the
+ticket in the `token` header and `ticket`/`randstr` in the body.
 
 ---
 
