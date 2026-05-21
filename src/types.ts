@@ -1,4 +1,7 @@
-export type Carrier = "imile" | "injaz" | "jt" | "jdw";
+export type Carrier = "imile" | "injaz" | "jt" | "jdw" | "naqel";
+
+export type NormalizedStatus = "Delivered" | "In Transit" | "Out for Delivery" | "Returned";
+
 
 export interface TrackEvent {
   /** ISO 8601 timestamp when the event occurred, or null if the source did not provide one. */
@@ -26,7 +29,9 @@ export interface TrackResult {
   latestStatus: string | null;
   /** Latest known status time (ISO). */
   latestTime: string | null;
-  /** Track events ordered newest -> oldest. */
+  /** Canonical status: Delivered | In Transit | Out for Delivery | Returned. */
+  normalizedStatus: NormalizedStatus | null;
+  /** Track events ordered newest -> oldest (default) or oldest -> newest (?order=asc). */
   events: TrackEvent[];
   /** Optional extra fields returned by the source. */
   extra?: Record<string, unknown>;

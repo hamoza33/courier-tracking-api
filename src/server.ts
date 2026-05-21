@@ -9,6 +9,7 @@ import { trackImile } from "./carriers/imile.js";
 import { trackInjaz } from "./carriers/injaz.js";
 import { trackJt } from "./carriers/jt.js";
 import { trackJdw } from "./carriers/jdw.js";
+import { trackNaqel } from "./carriers/naqel.js";
 import { CarrierError, type Carrier, type TrackResult } from "./types.js";
 import { formatMultipleAsText, formatTrackResultAsText } from "./format.js";
 
@@ -27,6 +28,12 @@ function wantsPretty(req: import("fastify").FastifyRequest): boolean {
   const q = req.query as Record<string, string | undefined> | undefined;
   const v = (q?.pretty ?? "").toLowerCase();
   return v === "1" || v === "true" || v === "yes";
+}
+
+function getOrder(req: import("fastify").FastifyRequest): "asc" | "desc" {
+  const q = req.query as Record<string, string | undefined> | undefined;
+  const v = (q?.order ?? "").toLowerCase();
+  return v === "asc" ? "asc" : "desc";
 }
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -53,7 +60,7 @@ async function start() {
       info: {
         title: "Courier Tracking Aggregator API",
         description:
-          "Unified tracking API across iMile, Injaz Express, J&T Express, and JDW (JINGDONG) Logistics.",
+          "Unified tracking API across iMile, Injaz Express, J&T Express, JDW (JINGDONG) Logistics, and Naqel Express.",
         version: "1.0.0",
       },
       servers: [{ url: `http://localhost:${PORT}` }],
@@ -138,13 +145,14 @@ async function start() {
       { code: "injaz", name: "Injaz Express", captchaRequired: false },
       { code: "jt", name: "J&T Express", captchaRequired: true },
       { code: "jdw", name: "JDW Logistics (JINGDONG)", captchaRequired: false },
+      { code: "naqel", name: "Naqel Express", captchaRequired: false },
     ]
   );
 
   // ----- tracking endpoints -----
 
-  // GET /track?waybill=...&lang=en[&carrier=imile][&format=text][&pretty=1]
-  fastify.get<{ Querystring: { waybill?: string; lang?: string; carrier?: string; format?: string; pretty?: string } }>(
+  // GET /track?waybill=...&lang=en[&carrier=imile][&format=text][&pretty=1][&order=desc]
+  fastify.get<{ Querystring: { waybill?: string; lang?: string; carrier?: string; format?: string; pretty?: string; order?: string } }>(
     "/track",
     {
       schema: {
@@ -158,8 +166,13 @@ async function start() {
             lang: { type: "string", description: "Language preference (e.g. en, ar)" },
             carrier: {
               type: "string",
-              enum: ["imile", "injaz", "jt", "jdw", "auto", "all"],
+              enum: ["imile", "injaz", "jt", "jdw", "naqel", "auto", "all"],
               description: "Force a specific carrier, or 'all' to query every carrier in parallel",
+            },
+            order: {
+              type: "string",
+              enum: ["desc", "asc"],
+              description: "Event sort order. 'desc' (default) = newest first, 'asc' = oldest first.",
             },
             format: {
               type: "string",
@@ -180,28 +193,32 @@ async function start() {
         return reply.code(400).send({ error: "waybill is required" });
       }
       const carrier = req.query.carrier ?? "auto";
+      const order = getOrder(req);
 
       if (carrier === "all") {
         const results = await runAll(waybill, lang);
+        applyOrderToMulti(results, order);
         return sendResult(req, reply, results, true);
       }
       if (carrier !== "auto") {
         const single = await runOneOrError(carrier as Carrier, waybill, lang);
+        applyOrder(single, order);
         return sendResult(req, reply, single, false);
       }
       const detected = detectCarrier(waybill);
       if (!detected) {
-        // Fall back to querying every carrier in parallel.
         const results = await runAll(waybill, lang);
+        applyOrderToMulti(results, order);
         return sendResult(req, reply, results, true);
       }
       const single = await runOneOrError(detected, waybill, lang);
+      applyOrder(single, order);
       return sendResult(req, reply, single, false);
     }
   );
 
-  // GET /track/:carrier/:waybill[?format=text&pretty=1]
-  fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string; format?: string; pretty?: string } }>(
+  // GET /track/:carrier/:waybill[?format=text&pretty=1&order=desc]
+  fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string; format?: string; pretty?: string; order?: string } }>(
     "/track/:carrier/:waybill",
     {
       schema: {
@@ -210,7 +227,7 @@ async function start() {
         params: {
           type: "object",
           properties: {
-            carrier: { type: "string", enum: ["imile", "injaz", "jt", "jdw"] },
+            carrier: { type: "string", enum: ["imile", "injaz", "jt", "jdw", "naqel"] },
             waybill: { type: "string" },
           },
           required: ["carrier", "waybill"],
@@ -221,6 +238,7 @@ async function start() {
             lang: { type: "string" },
             format: { type: "string", enum: ["json", "text"] },
             pretty: { type: "string" },
+            order: { type: "string", enum: ["desc", "asc"] },
           },
         },
       },
@@ -228,7 +246,9 @@ async function start() {
     async (req, reply) => {
       const { carrier, waybill } = req.params;
       const lang = req.query.lang;
+      const order = getOrder(req);
       const single = await runOneOrError(carrier as Carrier, waybill, lang);
+      applyOrder(single, order);
       return sendResult(req, reply, single, false);
     }
   );
@@ -283,6 +303,8 @@ async function start() {
           return await trackJt(waybill, { lang });
         case "jdw":
           return await trackJdw(waybill, lang);
+        case "naqel":
+          return await trackNaqel(waybill);
       }
     } catch (err) {
       if (err instanceof CarrierError) {
@@ -320,12 +342,32 @@ async function start() {
           return { result: await trackJt(waybill, { lang }) };
         case "jdw":
           return { result: await trackJdw(waybill, lang) };
+        case "naqel":
+          return { result: await trackNaqel(waybill) };
       }
     } catch (err) {
       if (err instanceof CarrierError) {
         return { error: { message: err.message, captchaRequired: err.captchaRequired } };
       }
       return { error: { message: (err as Error).message } };
+    }
+  }
+
+  /** Sort events in a single TrackResult according to the requested order. */
+  function applyOrder(
+    result: TrackResult | { error: string; statusCode: number },
+    order: "asc" | "desc"
+  ): void {
+    if ("error" in result) return;
+    if (order === "asc") {
+      result.events.reverse();
+    }
+    // default (desc) = newest first — already how carriers return data
+  }
+
+  function applyOrderToMulti(results: MultiTrackResult[], order: "asc" | "desc"): void {
+    for (const item of results) {
+      if (item.result) applyOrder(item.result, order);
     }
   }
 

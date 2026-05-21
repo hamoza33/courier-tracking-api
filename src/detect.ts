@@ -17,16 +17,19 @@ export function detectCarrier(waybillNo: string): Carrier | null {
   if (/^JTE\d{10,14}$/.test(w)) return "jt";
   if (/^JDW\d{6,16}$/.test(w)) return "jdw";
   if (/^INJAZ[A-Z0-9]{4,16}$/.test(w)) return "injaz";
+  // Naqel waybills: 9-digit all-numeric (shorter than iMile's 11-16 digits)
+  if (/^\d{7,9}$/.test(w)) return "naqel";
   if (/^\d{10,16}$/.test(w)) return "imile";
 
   return null;
 }
 
-export const ALL_CARRIERS: Carrier[] = ["imile", "injaz", "jt", "jdw"];
+export const ALL_CARRIERS: Carrier[] = ["imile", "injaz", "jt", "jdw", "naqel"];
 
 export const CARRIER_NAMES: Record<Carrier, string> = {
   imile: "iMile",
   injaz: "Injaz Express",
   jt: "J&T Express",
   jdw: "JDW Logistics (Jingdong)",
+  naqel: "Naqel Express",
 };

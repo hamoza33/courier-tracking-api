@@ -11,6 +11,9 @@ export function formatTrackResultAsText(r: TrackResult): string {
   lines.push(`Waybill:       ${r.waybillNo}`);
   if (r.found) {
     lines.push(`Latest status: ${r.latestStatus ?? "(unknown)"}`);
+    if (r.normalizedStatus) {
+      lines.push(`Normalized:    ${r.normalizedStatus}`);
+    }
     lines.push(`Latest time:   ${r.latestTime ?? "(unknown)"}`);
   } else {
     lines.push("Status:        No tracking events found for this waybill.");
