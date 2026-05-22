@@ -1,4 +1,4 @@
-export type Carrier = "imile" | "injaz" | "jt" | "jdw";
+export type Carrier = "imile" | "injaz" | "jt" | "jdw" | "naqel";
 
 export interface TrackEvent {
   /** ISO 8601 timestamp when the event occurred, or null if the source did not provide one. */
