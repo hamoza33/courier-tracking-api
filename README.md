@@ -56,6 +56,72 @@ and returns an array.
 
 Same as above but with the carrier as a path parameter.
 
+### `POST /track/bulk`
+
+Track up to **100 waybills** in a single request. All carriers except J&T Express
+are processed in parallel. J&T waybills are processed **one-by-one** (sequentially)
+to handle the CAPTCHA requirement.
+
+**Request body:**
+
+```json
+{
+  "waybills": ["6050926815554", "JDW101107292775", "JTE000944462953"],
+  "lang": "en",
+  "order": "desc"
+}
+```
+
+Each item in `waybills` can be a plain string (carrier auto-detected) or an object:
+
+```json
+{
+  "waybills": [
+    "6050926815554",
+    { "waybill": "JTE000944462953", "carrier": "jt" }
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "total": 3,
+  "successful": 2,
+  "failed": 1,
+  "results": [
+    { "waybill": "6050926815554", "carrier": "imile", "result": { ... } },
+    { "waybill": "JDW101107292775", "carrier": "jdw", "result": { ... } },
+    { "waybill": "JTE000944462953", "carrier": "jt", "error": { "message": "..." } }
+  ]
+}
+```
+
+### `POST /track/benchmark`
+
+Benchmarks processing time for **50 vs 100** tracking numbers. Provide up to 100
+waybills; the endpoint runs the first 50, then all provided waybills, and
+returns timing comparisons.
+
+**Request body:** Same as `/track/bulk`.
+
+**Response:**
+
+```json
+{
+  "benchmark": {
+    "batch50": { "count": 50, "durationMs": 2340, "successful": 48, "failed": 2, "avgPerItem": 47 },
+    "batch100": { "count": 100, "durationMs": 4120, "successful": 95, "failed": 5, "avgPerItem": 41 },
+    "comparison": {
+      "speedupRatio": 1.76,
+      "note": "speedupRatio shows how much longer 100 takes compared to 50. Values close to 1.0 mean good parallelism."
+    }
+  },
+  "results": [ ... ]
+}
+```
+
 ### `GET /carriers`
 
 Lists supported carriers and whether each one requires a CAPTCHA.
