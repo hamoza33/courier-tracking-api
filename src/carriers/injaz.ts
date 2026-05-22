@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
+import { normalizeStatus } from "../normalize.js";
 
 /**
  * Injaz Express simply renders an HTML page in response to a form POST.
@@ -52,13 +53,17 @@ export async function trackInjaz(waybillNo: string): Promise<TrackResult> {
   // The Injaz timeline is rendered oldest -> newest in DOM order; reverse so newest is first.
   events.reverse();
 
+  const latestEvent = events[0];
+  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description) : null;
+
   return {
     carrier: "injaz",
     carrierName: "Injaz Express",
     waybillNo: wb,
     found: events.length > 0,
-    latestStatus: events[0]?.status ?? null,
-    latestTime: events[0]?.time ?? null,
+    latestStatus: latestEvent?.status ?? null,
+    latestTime: latestEvent?.time ?? null,
+    normalizedStatus: ns,
     events,
   };
 }

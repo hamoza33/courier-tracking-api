@@ -1,15 +1,9 @@
+import { chromium, type Browser, type Page } from "playwright";
+import sharp from "sharp";
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
+import { normalizeStatus } from "../normalize.js";
 
-const JT_BASE = "https://ofmg.jtjms-sa.com";
-const JT_REFERER = "https://www.jtexpress.me/";
-/**
- * Tencent Captcha appKey / "aid" used by J&T's KSA website. Captured from the
- * live captcha widget URL:
- *   `https://ca.turing.captcha.qcloud.com/cap_union_prehandle?aid=189943813&...`
- *
- * If J&T ever rotates it, override via the `JT_TENCENT_CAPTCHA_AID` env var.
- */
-const JT_TENCENT_CAPTCHA_AID = process.env.JT_TENCENT_CAPTCHA_AID || "189943813";
+const JT_URL = "https://www.jtexpress.me/KSA/trajectoryQuery";
 
 const JT_LANG_MAP: Record<string, string> = {
   en: "EN",
@@ -18,289 +12,407 @@ const JT_LANG_MAP: Record<string, string> = {
   "zh-cn": "CN",
 };
 
-interface JtTrackDetail {
-  scanType?: string | null;
+// ---------- v2 API response types ----------
+
+interface JtV2Detail {
   scanTypeName?: string | null;
   scanTime?: string | null;
-  acceptAddress?: string | null;
-  problemTypeName?: string | null;
-  /** Long human-readable description provided by J&T. */
-  desc?: string | null;
-  remark?: string | null;
-}
-
-interface JtTrackData {
-  waybillNo?: string;
-  details?: JtTrackDetail[];
-  waybillStatusName?: string;
-  /** Other fields that J&T may return (not used by us). */
+  customerTracking?: string | null;
+  status?: string | null;
+  scanNetworkName?: string | null;
+  scanNetworkCity?: string | null;
+  scanNetworkProvince?: string | null;
   [k: string]: unknown;
 }
 
-interface JtTrackResponse {
+interface JtV2Response {
   code?: number;
   msg?: string;
   succ?: boolean;
-  fail?: boolean;
-  data?: JtTrackData[] | null;
-}
-
-interface CaptchaSolution {
-  ticket: string;
-  randstr: string;
+  data?: Array<{
+    keyword?: string;
+    details?: JtV2Detail[];
+  }>;
 }
 
 interface JtOptions {
   lang?: string;
 }
 
-/** Common error helper. */
-function captchaError(msg: string, statusCode = 502): never {
-  throw new CarrierError("jt", msg, { statusCode, captchaRequired: true });
-}
+// ---------- Shared browser instance ----------
 
-/**
- * Solve J&T's Tencent (Turing / TJN) captcha via CapSolver.
- * Docs: https://docs.capsolver.com/guide/captcha/Tencent.html
- *
- * The Turing variant uses task type `AntiTurnstileTaskProxyless` for some
- * Tencent widgets but TJN puzzles are best targeted with
- * `AntiTencentCaptchaTaskProxyLess` (note casing). CapSolver accepts a few
- * aliases; we use the documented one.
- */
-async function solveTencentWithCapSolver(): Promise<CaptchaSolution> {
-  const key = process.env.CAPSOLVER_API_KEY;
-  if (!key) throw new Error("CAPSOLVER_API_KEY not set");
+let _browser: Browser | null = null;
 
-  const createBody = {
-    clientKey: key,
-    task: {
-      type: "AntiTencentCaptchaTaskProxyLess",
-      websiteURL: "https://www.jtexpress.me/KSA/trajectoryQuery",
-      appId: JT_TENCENT_CAPTCHA_AID,
-    },
-  };
-
-  const create = await fetch("https://api.capsolver.com/createTask", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(createBody),
+async function getBrowser(): Promise<Browser> {
+  if (_browser && _browser.isConnected()) return _browser;
+  _browser = await chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-blink-features=AutomationControlled",
+    ],
   });
-  const cj = (await create.json()) as {
-    errorId: number;
-    errorCode?: string;
-    errorDescription?: string;
-    taskId?: string;
-  };
-  if (cj.errorId !== 0 || !cj.taskId) {
-    captchaError(
-      `CapSolver createTask failed: ${cj.errorCode ?? ""} ${cj.errorDescription ?? JSON.stringify(cj)}`
-    );
-  }
-
-  const start = Date.now();
-  const maxMs = 120_000;
-  await sleep(3000);
-  while (Date.now() - start < maxMs) {
-    const r = await fetch("https://api.capsolver.com/getTaskResult", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientKey: key, taskId: cj.taskId! }),
-    });
-    const rj = (await r.json()) as {
-      errorId: number;
-      errorCode?: string;
-      errorDescription?: string;
-      status: "idle" | "ready" | "processing" | "failed";
-      solution?: { ticket?: string; randstr?: string; appid?: string };
-    };
-    if (rj.errorId !== 0) {
-      captchaError(`CapSolver getTaskResult failed: ${rj.errorCode ?? ""} ${rj.errorDescription ?? ""}`);
-    }
-    if (rj.status === "ready" && rj.solution?.ticket && rj.solution.randstr) {
-      return { ticket: rj.solution.ticket, randstr: rj.solution.randstr };
-    }
-    if (rj.status === "failed") {
-      captchaError(`CapSolver reported task failed: ${rj.errorDescription ?? ""}`);
-    }
-    await sleep(3000);
-  }
-  captchaError("CapSolver timed out solving Tencent CAPTCHA after 120s", 504);
+  return _browser;
 }
 
-/**
- * Solve J&T's captcha via 2Captcha (`method=tencent`).
- * Docs: https://2captcha.com/2captcha-api#tencent
- *
- * Note: 2Captcha's tencent solver is reliable for the classic Tencent widget
- * but has poor success rates against J&T's newer Turing (TJN) variant — kept
- * here only as a fallback.
- */
-async function solveTencentWith2Captcha(): Promise<CaptchaSolution> {
-  const key = process.env.TWOCAPTCHA_API_KEY;
-  if (!key) throw new Error("TWOCAPTCHA_API_KEY not set");
+// ---------- Template-matching slider solver ----------
 
-  const inUrl = new URL("https://2captcha.com/in.php");
-  inUrl.searchParams.set("key", key);
-  inUrl.searchParams.set("method", "tencent");
-  inUrl.searchParams.set("app_id", JT_TENCENT_CAPTCHA_AID);
-  inUrl.searchParams.set("pageurl", "https://www.jtexpress.me/KSA/trajectoryQuery");
-  inUrl.searchParams.set("json", "1");
+async function extractPiece(
+  compositeImgBuf: Buffer
+): Promise<{ buf: Buffer; w: number; h: number } | null> {
+  const meta = await sharp(compositeImgBuf).metadata();
+  const width = meta.width!;
+  const height = meta.height!;
+  const buf = await sharp(compositeImgBuf).ensureAlpha().raw().toBuffer();
 
-  const submit = await fetch(inUrl.toString(), { method: "GET" });
-  const submitJson = (await submit.json()) as { status: number; request: string };
-  if (submitJson.status !== 1) {
-    captchaError(`2Captcha submission failed: ${submitJson.request}`);
+  let minX = width,
+    minY = height,
+    maxX = 0,
+    maxY = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      const r = buf[idx],
+        g = buf[idx + 1],
+        b = buf[idx + 2],
+        a = buf[idx + 3];
+      if (a < 128) continue;
+      if (r > 230 && g > 230 && b > 230) continue;
+      if (b > 200 && r < 100) continue;
+      if (
+        Math.abs(r - g) < 5 &&
+        Math.abs(g - b) < 5 &&
+        r > 180 &&
+        r < 220
+      )
+        continue;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
   }
-  const captchaId = submitJson.request;
+  if (maxX <= minX || maxY <= minY) return null;
 
-  const resUrl = new URL("https://2captcha.com/res.php");
-  resUrl.searchParams.set("key", key);
-  resUrl.searchParams.set("action", "get");
-  resUrl.searchParams.set("id", captchaId);
-  resUrl.searchParams.set("json", "1");
+  const pW = maxX - minX + 1;
+  const pH = maxY - minY + 1;
+  const pieceBuf = await sharp(compositeImgBuf)
+    .extract({ left: minX, top: minY, width: pW, height: pH })
+    .toBuffer();
+  return { buf: pieceBuf, w: pW, h: pH };
+}
 
-  const start = Date.now();
-  const maxMs = 120_000;
-  await sleep(5000);
-  while (Date.now() - start < maxMs) {
-    const r = await fetch(resUrl.toString(), { method: "GET" });
-    const rj = (await r.json()) as { status: number; request: string };
-    if (rj.status === 1) {
-      const [ticket, randstr] = rj.request.split("|");
-      if (!ticket || !randstr) {
-        captchaError(`2Captcha returned malformed solution: ${rj.request}`);
+async function templateMatch(
+  bgBuf: Buffer,
+  pieceBuf: Buffer
+): Promise<number> {
+  const bgMeta = await sharp(bgBuf).metadata();
+  const pMeta = await sharp(pieceBuf).metadata();
+  const bgGray = await sharp(bgBuf).greyscale().raw().toBuffer();
+  const pGray = await sharp(pieceBuf).greyscale().raw().toBuffer();
+  const bgW = bgMeta.width!;
+  const bgH = bgMeta.height!;
+  const pW = pMeta.width!;
+  const pH = pMeta.height!;
+
+  function sobelEdges(gray: Buffer, w: number, h: number): Float64Array {
+    const edges = new Float64Array(w * h);
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const gx =
+          -gray[(y - 1) * w + (x - 1)] +
+          gray[(y - 1) * w + (x + 1)] -
+          2 * gray[y * w + (x - 1)] +
+          2 * gray[y * w + (x + 1)] -
+          gray[(y + 1) * w + (x - 1)] +
+          gray[(y + 1) * w + (x + 1)];
+        const gy =
+          -gray[(y - 1) * w + (x - 1)] -
+          2 * gray[(y - 1) * w + x] -
+          gray[(y - 1) * w + (x + 1)] +
+          gray[(y + 1) * w + (x - 1)] +
+          2 * gray[(y + 1) * w + x] +
+          gray[(y + 1) * w + (x + 1)];
+        edges[y * w + x] = Math.sqrt(gx * gx + gy * gy);
       }
-      return { ticket, randstr };
     }
-    if (rj.request !== "CAPCHA_NOT_READY") {
-      captchaError(`2Captcha returned error: ${rj.request}`);
-    }
-    await sleep(5000);
+    return edges;
   }
-  captchaError("2Captcha timed out solving Tencent CAPTCHA after 120s", 504);
+
+  const bgEdge = sobelEdges(bgGray, bgW, bgH);
+  const pEdge = sobelEdges(pGray, pW, pH);
+
+  let pSum = 0,
+    pSq = 0,
+    pN = 0;
+  for (let i = 0; i < pW * pH; i++) {
+    if (pEdge[i] > 10) {
+      pSum += pEdge[i];
+      pSq += pEdge[i] ** 2;
+      pN++;
+    }
+  }
+  const pMean = pSum / Math.max(pN, 1);
+  const pStd = Math.sqrt(pSq / Math.max(pN, 1) - pMean ** 2);
+
+  let bestX = 0,
+    bestCorr = -Infinity;
+  const searchStart = Math.floor(bgW * 0.2);
+  for (let sy = 0; sy < bgH - pH; sy += 2) {
+    for (let sx = searchStart; sx < bgW - pW; sx++) {
+      let sum = 0,
+        bSum = 0,
+        bSq = 0,
+        cnt = 0;
+      for (let ty = 0; ty < pH; ty += 2) {
+        for (let tx = 0; tx < pW; tx++) {
+          const tv = pEdge[ty * pW + tx];
+          if (tv < 10) continue;
+          const bv = bgEdge[(sy + ty) * bgW + (sx + tx)];
+          sum += tv * bv;
+          bSum += bv;
+          bSq += bv ** 2;
+          cnt++;
+        }
+      }
+      if (cnt < 10) continue;
+      const bMean = bSum / cnt;
+      const bStd = Math.sqrt(bSq / cnt - bMean ** 2);
+      const ncc =
+        (sum / cnt - pMean * bMean) /
+        (Math.max(pStd, 1) * Math.max(bStd, 1));
+      if (ncc > bestCorr) {
+        bestCorr = ncc;
+        bestX = sx;
+      }
+    }
+  }
+  return bestX;
 }
 
-/**
- * Try every configured captcha provider in order of reliability for Tencent
- * Turing (TJN). Returns the first success, or aggregates errors if all fail.
- */
-async function solveTencentCaptcha(): Promise<CaptchaSolution> {
-  const providers: Array<{ name: string; fn: () => Promise<CaptchaSolution> }> = [];
-  if (process.env.CAPSOLVER_API_KEY) providers.push({ name: "CapSolver", fn: solveTencentWithCapSolver });
-  if (process.env.TWOCAPTCHA_API_KEY) providers.push({ name: "2Captcha", fn: solveTencentWith2Captcha });
-
-  if (providers.length === 0) {
-    throw new CarrierError(
-      "jt",
-      "J&T Express requires solving a Tencent CAPTCHA. Set CAPSOLVER_API_KEY (recommended) or TWOCAPTCHA_API_KEY to enable automatic solving.",
-      { statusCode: 502, captchaRequired: true }
-    );
-  }
-
-  const errors: string[] = [];
-  for (const p of providers) {
-    try {
-      return await p.fn();
-    } catch (err) {
-      errors.push(`${p.name}: ${(err as Error).message}`);
-    }
-  }
-  throw new CarrierError("jt", `All captcha providers failed: ${errors.join(" | ")}`, {
-    statusCode: 502,
-    captchaRequired: true,
-  });
-}
+// ---------- Humanlike drag ----------
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function commonHeaders(lang: string, token: string): Record<string, string> {
-  return {
-    "Content-Type": "application/json",
-    Accept: "application/json, text/plain, */*",
-    "Cache-Control": "max-age=2, must-revalidate",
-    countryId: "1",
-    langType: lang,
-    timezone: "GMT+0000",
-    token,
-    "User-Agent":
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    Origin: "https://www.jtexpress.me",
-    Referer: JT_REFERER,
-  };
+async function humanlikeDrag(
+  page: Page,
+  startX: number,
+  startY: number,
+  endX: number
+): Promise<void> {
+  const totalSteps = 35 + Math.floor(Math.random() * 15);
+  const dx = endX - startX;
+
+  await page.mouse.move(startX - 20, startY + 10);
+  await sleep(300 + Math.random() * 200);
+  await page.mouse.move(startX, startY);
+  await sleep(150 + Math.random() * 100);
+  await page.mouse.down();
+  await sleep(100 + Math.random() * 150);
+
+  for (let i = 1; i <= totalSteps; i++) {
+    const t = i / totalSteps;
+    const eased =
+      t < 0.7
+        ? (t / 0.7) * 1.03
+        : t < 0.85
+          ? 1.03 - ((t - 0.7) / 0.15) * 0.02
+          : 1.01 - ((t - 0.85) / 0.15) * 0.01;
+    const x = startX + dx * eased + (Math.random() - 0.5) * 0.5;
+    const y =
+      startY +
+      Math.sin(t * Math.PI * 3) * 1.5 +
+      (Math.random() - 0.5) * 1;
+    await page.mouse.move(x, y);
+    await sleep(t < 0.1 || t > 0.9 ? 25 : 8 + Math.random() * 10);
+  }
+  await page.mouse.move(endX, startY);
+  await sleep(30 + Math.random() * 50);
+  await page.mouse.up();
 }
 
-function deriveJtStatus(d: JtTrackDetail): string | null {
-  // Prefer the J&T-supplied scanTypeName; otherwise inspect desc/scanType.
-  const name = (d.scanTypeName || d.problemTypeName || "").trim();
+// ---------- Single captcha solve attempt ----------
+
+async function solveAndTrack(
+  browser: Browser,
+  waybillNo: string
+): Promise<JtV2Response> {
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    viewport: { width: 1280, height: 800 },
+  });
+  const page = await context.newPage();
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+  });
+
+  const captchaImages: Record<string, Buffer> = {};
+  let trackingData: JtV2Response | null = null;
+
+  const trackingPromise = new Promise<JtV2Response | null>((resolve) => {
+    const timer = setTimeout(() => resolve(null), 25000);
+    page.on("response", async (response) => {
+      const url = response.url();
+      if (url.includes("cap_union_new_getcapbysig")) {
+        try {
+          const buf = await response.body();
+          const idx = new URL(url).searchParams.get("img_index");
+          if (idx) captchaImages[idx] = buf;
+        } catch {
+          /* ignore */
+        }
+      }
+      if (url.includes("getDetailByWaybillNo")) {
+        try {
+          const body = (await response.json()) as JtV2Response;
+          clearTimeout(timer);
+          resolve(body);
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+  });
+
+  try {
+    await page.goto(`${JT_URL}?waybillNo=${waybillNo}`, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
+    await page.waitForSelector(".tencent-captcha-dy__fg-item", {
+      timeout: 15000,
+    });
+    await page.waitForTimeout(3000);
+
+    if (!captchaImages["0"] || !captchaImages["1"]) {
+      await page.waitForTimeout(3000);
+    }
+    if (!captchaImages["1"] || !captchaImages["0"]) {
+      throw new Error("Failed to capture captcha images from network");
+    }
+
+    const piece = await extractPiece(captchaImages["0"]);
+    if (!piece) throw new Error("Failed to extract puzzle piece");
+
+    const offsetXInImage = await templateMatch(captchaImages["1"], piece.buf);
+
+    const dims = await page.evaluate(() => {
+      const slider = document.querySelector(
+        ".tencent-captcha-dy__slider-block"
+      );
+      const imageArea = document.querySelector(
+        ".tencent-captcha-dy__image-area"
+      );
+      const fgItem = document.querySelector(".tencent-captcha-dy__fg-item");
+      if (!slider || !imageArea) return null;
+      return {
+        slider: slider.getBoundingClientRect(),
+        imageArea: imageArea.getBoundingClientRect(),
+        fgItem: fgItem?.getBoundingClientRect() ?? null,
+      };
+    });
+    if (!dims) throw new Error("Could not find captcha slider elements");
+
+    const bgMeta = await sharp(captchaImages["1"]).metadata();
+    const scale = dims.imageArea.width / bgMeta.width!;
+    const displayOffsetX = offsetXInImage * scale;
+    const fgRelX = dims.fgItem
+      ? dims.fgItem.x - dims.imageArea.x
+      : 24;
+    const dragDistance = displayOffsetX - fgRelX;
+
+    const startX = dims.slider.x + dims.slider.width / 2;
+    const startY = dims.slider.y + dims.slider.height / 2;
+
+    await humanlikeDrag(page, startX, startY, startX + dragDistance);
+
+    trackingData = await trackingPromise;
+    if (!trackingData) throw new Error("Tracking API not called after solve");
+    return trackingData;
+  } finally {
+    await context.close();
+  }
+}
+
+// ---------- deriveJtStatus ----------
+
+function deriveJtStatus(d: JtV2Detail): string | null {
+  const name = (d.scanTypeName || d.status || "").trim();
   if (name) return name;
-  const desc = (d.desc || d.remark || "").toLowerCase();
+  const desc = (d.customerTracking || "").toLowerCase();
   if (!desc) return null;
   if (desc.includes("delivered") || desc.includes("signed")) return "Delivered";
   if (desc.includes("out for delivery")) return "Out for Delivery";
-  if (desc.includes("transit") || desc.includes("arrived") || desc.includes("departed")) return "In Transit";
-  if (desc.includes("picked up")) return "Picked Up";
+  if (desc.includes("returned")) return "Returned";
   return null;
 }
 
-export async function trackJt(waybillNo: string, opts: JtOptions = {}): Promise<TrackResult> {
+// ---------- Main export ----------
+
+export async function trackJt(
+  waybillNo: string,
+  opts: JtOptions = {}
+): Promise<TrackResult> {
   const wb = waybillNo.trim();
-  const langType = JT_LANG_MAP[(opts.lang ?? "en").toLowerCase()] ?? "EN";
 
-  // Resolve captcha first (or fail fast if not configured).
-  const solution = await solveTencentCaptcha();
+  const maxAttempts = 3;
+  let lastError: Error | null = null;
 
-  const body = JSON.stringify({
-    waybillNo: [wb],
-    langType,
-    ticket: solution.ticket,
-    randstr: solution.randstr,
-  });
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const browser = await getBrowser();
+      const response = await solveAndTrack(browser, wb);
 
-  let resp: Response;
-  try {
-    resp = await fetch(`${JT_BASE}/official/express/getDetailByWaybillNo`, {
-      method: "POST",
-      headers: commonHeaders(langType, solution.ticket),
-      body,
-    });
-  } catch (err) {
-    throw new CarrierError("jt", `Network error contacting J&T Express: ${(err as Error).message}`);
+      if (!response.succ && response.code !== 1) {
+        throw new CarrierError(
+          "jt",
+          `J&T Express returned error code ${response.code}: ${response.msg ?? ""}`,
+          { statusCode: 502 }
+        );
+      }
+
+      const record = response.data?.[0];
+      const events: TrackEvent[] = (record?.details ?? []).map((d) => ({
+        time: d.scanTime ?? null,
+        status: deriveJtStatus(d),
+        description: (d.customerTracking || d.scanTypeName || "").trim(),
+        location:
+          [d.scanNetworkName, d.scanNetworkCity]
+            .filter(Boolean)
+            .join(", ") || null,
+      }));
+
+      const latestEvent = events[0];
+      const ns = latestEvent
+        ? normalizeStatus(latestEvent.status, latestEvent.description)
+        : null;
+
+      return {
+        carrier: "jt",
+        carrierName: "J&T Express",
+        waybillNo: record?.keyword ?? wb,
+        found: events.length > 0,
+        latestStatus: latestEvent?.status ?? null,
+        latestTime: latestEvent?.time ?? null,
+        normalizedStatus: ns,
+        events,
+      };
+    } catch (err) {
+      lastError = err as Error;
+      if (err instanceof CarrierError) throw err;
+      // Retry on captcha solve failures
+    }
   }
 
-  if (!resp.ok) {
-    throw new CarrierError("jt", `J&T Express responded HTTP ${resp.status}`);
-  }
-
-  const j = (await resp.json()) as JtTrackResponse;
-  if (j.succ !== true || !Array.isArray(j.data)) {
-    throw new CarrierError(
-      "jt",
-      `J&T Express returned error code ${j.code}: ${j.msg ?? ""}`,
-      { captchaRequired: j.code === 135010037 }
-    );
-  }
-
-  const record = j.data[0];
-  const events: TrackEvent[] = (record?.details ?? []).map((d) => ({
-    time: d.scanTime ?? null,
-    status: deriveJtStatus(d),
-    description: (d.desc || d.remark || d.scanTypeName || "").trim(),
-    location: d.acceptAddress ?? null,
-  }));
-
-  return {
-    carrier: "jt",
-    carrierName: "J&T Express",
-    waybillNo: record?.waybillNo ?? wb,
-    found: events.length > 0,
-    latestStatus: events[0]?.status ?? record?.waybillStatusName ?? null,
-    latestTime: events[0]?.time ?? null,
-    events,
-    extra: {
-      waybillStatusName: record?.waybillStatusName ?? null,
-    },
-  };
+  throw new CarrierError(
+    "jt",
+    `J&T Express slider captcha failed after ${maxAttempts} attempts: ${lastError?.message ?? "unknown"}`,
+    { statusCode: 502, captchaRequired: true }
+  );
 }

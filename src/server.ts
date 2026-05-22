@@ -35,16 +35,10 @@ function wantsPretty(req: import("fastify").FastifyRequest): boolean {
   return v === "1" || v === "true" || v === "yes";
 }
 
-/**
- * Determine ordering preference. Default is "asc" (earliest → most recent),
- * which matches how courier websites typically render their timelines and
- * what users requested. Pass `?order=desc` to flip it.
- */
-function orderOf(req: import("fastify").FastifyRequest): "asc" | "desc" {
+function getOrder(req: import("fastify").FastifyRequest): "asc" | "desc" {
   const q = req.query as Record<string, string | undefined> | undefined;
   const v = (q?.order ?? "").toLowerCase();
-  if (v === "desc" || v === "newest" || v === "reverse") return "desc";
-  return "asc";
+  return v === "asc" ? "asc" : "desc";
 }
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -71,7 +65,7 @@ async function start() {
       info: {
         title: "Courier Tracking Aggregator API",
         description:
-          "Unified tracking API across iMile, Injaz Express, J&T Express, and JDW (JINGDONG) Logistics.",
+          "Unified tracking API across iMile, Injaz Express, J&T Express, JDW (JINGDONG) Logistics, and Naqel Express.",
         version: "1.0.0",
       },
       servers: [{ url: `http://localhost:${PORT}` }],
@@ -123,7 +117,7 @@ async function start() {
       },
       queryParams: {
         format: "'json' (default) or 'text' — text returns a step-by-step plain-text timeline.",
-        order: "'asc' (default, earliest → most recent) or 'desc' to reverse.",
+        order: "'desc' (default, most recent first) or 'asc' for oldest first.",
         pretty: "'1' for pretty-printed JSON.",
         lang: "Optional language hint, e.g. en, ar.",
         carrier: "On /track: force a carrier (imile|injaz|jdw|naqel|jt) or 'all'.",
@@ -163,13 +157,12 @@ async function start() {
       { code: "injaz", name: "Injaz Express", captchaRequired: false },
       { code: "jdw", name: "JDW Logistics (JINGDONG)", captchaRequired: false },
       { code: "naqel", name: "Naqel Express", captchaRequired: false },
-      { code: "jt", name: "J&T Express", captchaRequired: true },
     ]
   );
 
   // ----- tracking endpoints -----
 
-  // GET /track?waybill=...&lang=en[&carrier=imile][&format=text][&pretty=1][&order=asc]
+  // GET /track?waybill=...&lang=en[&carrier=imile][&format=text][&pretty=1][&order=desc]
   fastify.get<{ Querystring: { waybill?: string; lang?: string; carrier?: string; format?: string; pretty?: string; order?: string } }>(
     "/track",
     {
@@ -187,6 +180,11 @@ async function start() {
               enum: ["imile", "injaz", "jt", "jdw", "naqel", "auto", "all"],
               description: "Force a specific carrier, or 'all' to query every carrier in parallel",
             },
+            order: {
+              type: "string",
+              enum: ["desc", "asc"],
+              description: "Event sort order. 'desc' (default) = newest first, 'asc' = oldest first.",
+            },
             format: {
               type: "string",
               enum: ["json", "text"],
@@ -196,11 +194,7 @@ async function start() {
               type: "string",
               description: "Set to '1' to pretty-print JSON output.",
             },
-            order: {
-              type: "string",
-              enum: ["asc", "desc"],
-              description: "Event order. Default 'asc' (earliest → most recent).",
-            },
+
           },
         },
       },
@@ -211,27 +205,31 @@ async function start() {
         return reply.code(400).send({ error: "waybill is required" });
       }
       const carrier = req.query.carrier ?? "auto";
+      const order = getOrder(req);
 
       if (carrier === "all") {
         const results = await runAll(waybill, lang);
+        applyOrderToMulti(results, order);
         return sendResult(req, reply, results, true);
       }
       if (carrier !== "auto") {
         const single = await runOneOrError(carrier as Carrier, waybill, lang);
+        applyOrder(single, order);
         return sendResult(req, reply, single, false);
       }
       const detected = detectCarrier(waybill);
       if (!detected) {
-        // Fall back to querying every carrier in parallel.
         const results = await runAll(waybill, lang);
+        applyOrderToMulti(results, order);
         return sendResult(req, reply, results, true);
       }
       const single = await runOneOrError(detected, waybill, lang);
+      applyOrder(single, order);
       return sendResult(req, reply, single, false);
     }
   );
 
-  // GET /track/:carrier/:waybill[?format=text&pretty=1&order=asc]
+  // GET /track/:carrier/:waybill[?format=text&pretty=1&order=desc]
   fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string; format?: string; pretty?: string; order?: string } }>(
     "/track/:carrier/:waybill",
     {
@@ -252,7 +250,7 @@ async function start() {
             lang: { type: "string" },
             format: { type: "string", enum: ["json", "text"] },
             pretty: { type: "string" },
-            order: { type: "string", enum: ["asc", "desc"] },
+            order: { type: "string", enum: ["desc", "asc"] },
           },
         },
       },
@@ -260,7 +258,9 @@ async function start() {
     async (req, reply) => {
       const { carrier, waybill } = req.params;
       const lang = req.query.lang;
+      const order = getOrder(req);
       const single = await runOneOrError(carrier as Carrier, waybill, lang);
+      applyOrder(single, order);
       return sendResult(req, reply, single, false);
     }
   );
@@ -272,7 +272,7 @@ async function start() {
     payload: TrackResult | MultiTrackResult[] | { error: string; carrier?: string; captchaRequired?: boolean; statusCode: number },
     isArray: boolean
   ) {
-    const order = orderOf(req);
+    const order = getOrder(req);
     const fmtOpts: FormatOptions = { order };
 
     // Error envelope
@@ -378,6 +378,24 @@ async function start() {
         return { error: { message: err.message, captchaRequired: err.captchaRequired } };
       }
       return { error: { message: (err as Error).message } };
+    }
+  }
+
+  /** Sort events in a single TrackResult according to the requested order. */
+  function applyOrder(
+    result: TrackResult | { error: string; statusCode: number },
+    order: "asc" | "desc"
+  ): void {
+    if ("error" in result) return;
+    if (order === "asc") {
+      result.events.reverse();
+    }
+    // default (desc) = newest first — already how carriers return data
+  }
+
+  function applyOrderToMulti(results: MultiTrackResult[], order: "asc" | "desc"): void {
+    for (const item of results) {
+      if (item.result) applyOrder(item.result, order);
     }
   }
 

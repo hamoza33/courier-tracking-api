@@ -1,4 +1,5 @@
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
+import { normalizeStatus } from "../normalize.js";
 
 interface JdwTrackNode {
   hasPodUrl?: number;
@@ -77,13 +78,17 @@ export async function trackJdw(waybillNo: string, lang = "en"): Promise<TrackRes
     location: null,
   }));
 
+  const latestEvent = events[0];
+  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description) : null;
+
   return {
     carrier: "jdw",
     carrierName: "JDW Logistics",
     waybillNo: wb,
     found: events.length > 0,
-    latestStatus: events[0]?.status ?? null,
-    latestTime: events[0]?.time ?? null,
+    latestStatus: latestEvent?.status ?? null,
+    latestTime: latestEvent?.time ?? null,
+    normalizedStatus: ns,
     events,
     extra: {
       waybillNum: first?.waybillNum ?? null,
