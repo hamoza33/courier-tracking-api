@@ -2,7 +2,6 @@ export type Carrier = "imile" | "injaz" | "jt" | "jdw" | "naqel";
 
 export type NormalizedStatus = "Delivered" | "In Transit" | "Out for Delivery" | "Returned";
 
-
 export interface TrackEvent {
   /** ISO 8601 timestamp when the event occurred, or null if the source did not provide one. */
   time: string | null;

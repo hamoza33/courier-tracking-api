@@ -18,6 +18,8 @@ are normalised across carriers (`events[]`, `latestStatus`, `latestTime`,
 
 A live OpenAPI / Swagger UI is served at **`/docs`**.
 
+**Live deployment:** https://courier-tracking-api.fly.dev
+
 ---
 
 ## Endpoints

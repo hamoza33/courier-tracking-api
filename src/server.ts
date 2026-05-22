@@ -11,7 +11,12 @@ import { trackJt } from "./carriers/jt.js";
 import { trackJdw } from "./carriers/jdw.js";
 import { trackNaqel } from "./carriers/naqel.js";
 import { CarrierError, type Carrier, type TrackResult } from "./types.js";
-import { formatMultipleAsText, formatTrackResultAsText } from "./format.js";
+import {
+  formatMultipleAsText,
+  formatTrackResultAsText,
+  normalizeForJson,
+  type FormatOptions,
+} from "./format.js";
 
 type MultiTrackResult = { carrier: string; result?: TrackResult; error?: { message: string; captchaRequired?: boolean } };
 
@@ -110,6 +115,13 @@ async function start() {
         carriers: "GET /carriers",
         health: "GET /health",
       },
+      queryParams: {
+        format: "'json' (default) or 'text' — text returns a step-by-step plain-text timeline.",
+        order: "'desc' (default, most recent first) or 'asc' for oldest first.",
+        pretty: "'1' for pretty-printed JSON.",
+        lang: "Optional language hint, e.g. en, ar.",
+        carrier: "On /track: force a carrier (imile|injaz|jdw|naqel|jt) or 'all'.",
+      },
     })
   );
 
@@ -143,7 +155,6 @@ async function start() {
     async () => [
       { code: "imile", name: "iMile", captchaRequired: false },
       { code: "injaz", name: "Injaz Express", captchaRequired: false },
-      { code: "jt", name: "J&T Express", captchaRequired: true },
       { code: "jdw", name: "JDW Logistics (JINGDONG)", captchaRequired: false },
       { code: "naqel", name: "Naqel Express", captchaRequired: false },
     ]
@@ -183,6 +194,7 @@ async function start() {
               type: "string",
               description: "Set to '1' to pretty-print JSON output.",
             },
+
           },
         },
       },
@@ -260,6 +272,9 @@ async function start() {
     payload: TrackResult | MultiTrackResult[] | { error: string; carrier?: string; captchaRequired?: boolean; statusCode: number },
     isArray: boolean
   ) {
+    const order = getOrder(req);
+    const fmtOpts: FormatOptions = { order };
+
     // Error envelope
     if (!Array.isArray(payload) && "error" in payload && "statusCode" in payload) {
       const { statusCode, ...rest } = payload;
@@ -273,15 +288,28 @@ async function start() {
 
     if (wantsText(req)) {
       reply.type("text/plain; charset=utf-8");
-      if (isArray) return formatMultipleAsText(payload as MultiTrackResult[]);
-      return formatTrackResultAsText(payload as TrackResult);
+      if (isArray) return formatMultipleAsText(payload as MultiTrackResult[], fmtOpts);
+      return formatTrackResultAsText(payload as TrackResult, fmtOpts);
+    }
+
+    // JSON: always normalize so the events array is step-by-step (with the
+    // carrier name attached to each event) and in chronological order.
+    let jsonPayload: unknown;
+    if (isArray) {
+      jsonPayload = (payload as MultiTrackResult[]).map((m) =>
+        m.result
+          ? { carrier: m.carrier, result: normalizeForJson(m.result, fmtOpts) }
+          : { carrier: m.carrier, error: m.error }
+      );
+    } else {
+      jsonPayload = normalizeForJson(payload as TrackResult, fmtOpts);
     }
 
     if (wantsPretty(req)) {
       reply.type("application/json; charset=utf-8");
-      return JSON.stringify(payload, null, 2);
+      return JSON.stringify(jsonPayload, null, 2);
     }
-    return payload;
+    return jsonPayload;
   }
 
   /** Run one carrier and convert errors into a structured payload (no Fastify reply side-effects). */
