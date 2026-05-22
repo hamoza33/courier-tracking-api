@@ -399,6 +399,256 @@ async function start() {
     }
   }
 
+  // ----- bulk tracking endpoint -----
+
+  type BulkItem = { waybill: string; carrier?: string; lang?: string };
+  type BulkResultItem = {
+    waybill: string;
+    carrier: string;
+    result?: TrackResult;
+    error?: { message: string; captchaRequired?: boolean };
+  };
+
+  /**
+   * Track a single waybill safely (no throw), returning a BulkResultItem.
+   * Uses auto-detect if carrier is not specified.
+   */
+  async function trackOneBulk(item: BulkItem): Promise<BulkResultItem> {
+    const waybill = item.waybill.trim();
+    const carrierHint = item.carrier?.toLowerCase() ?? "auto";
+    const lang = item.lang;
+
+    let carrier: Carrier | null = null;
+    if (carrierHint !== "auto" && ALL_CARRIERS.includes(carrierHint as Carrier)) {
+      carrier = carrierHint as Carrier;
+    } else {
+      carrier = detectCarrier(waybill);
+    }
+
+    if (!carrier) {
+      return { waybill, carrier: "unknown", error: { message: "Could not detect carrier for this waybill" } };
+    }
+
+    const res = await runOneSafe(carrier, waybill, lang);
+    return { waybill, carrier, result: res.result, error: res.error };
+  }
+
+  // POST /track/bulk
+  fastify.post<{ Body: { waybills: (string | BulkItem)[]; lang?: string; order?: string } }>(
+    "/track/bulk",
+    {
+      schema: {
+        tags: ["tracking"],
+        summary: "Track up to 100 waybills at once. J&T waybills are processed sequentially (CAPTCHA).",
+        body: {
+          type: "object",
+          required: ["waybills"],
+          properties: {
+            waybills: {
+              type: "array",
+              maxItems: 100,
+              items: {
+                oneOf: [
+                  { type: "string", description: "Waybill number (carrier auto-detected)" },
+                  {
+                    type: "object",
+                    properties: {
+                      waybill: { type: "string" },
+                      carrier: { type: "string", enum: ["imile", "injaz", "jt", "jdw", "naqel", "auto"] },
+                      lang: { type: "string" },
+                    },
+                    required: ["waybill"],
+                  },
+                ],
+              },
+              description: "Array of waybill numbers or objects with waybill + optional carrier/lang. Max 100.",
+            },
+            lang: { type: "string", description: "Default language for all waybills" },
+            order: { type: "string", enum: ["desc", "asc"], description: "Event sort order (default: desc)" },
+          },
+        },
+      },
+    },
+    async (req, reply) => {
+      const { waybills, lang: defaultLang, order: orderParam } = req.body;
+      if (!waybills || waybills.length === 0) {
+        return reply.code(400).send({ error: "waybills array is required and must not be empty" });
+      }
+      if (waybills.length > 100) {
+        return reply.code(400).send({ error: "Maximum 100 waybills per request" });
+      }
+
+      const order = (orderParam ?? "desc") === "asc" ? "asc" as const : "desc" as const;
+
+      // Normalize input: strings become BulkItem objects
+      const items: BulkItem[] = waybills.map((w) =>
+        typeof w === "string" ? { waybill: w, lang: defaultLang } : { ...w, lang: w.lang ?? defaultLang }
+      );
+
+      // Separate J&T from non-J&T for special handling
+      const jtItems: BulkItem[] = [];
+      const nonJtItems: BulkItem[] = [];
+
+      for (const item of items) {
+        const carrierHint = item.carrier?.toLowerCase() ?? "auto";
+        let resolved: Carrier | null = null;
+        if (carrierHint !== "auto" && ALL_CARRIERS.includes(carrierHint as Carrier)) {
+          resolved = carrierHint as Carrier;
+        } else {
+          resolved = detectCarrier(item.waybill.trim());
+        }
+        if (resolved === "jt") {
+          jtItems.push(item);
+        } else {
+          nonJtItems.push(item);
+        }
+      }
+
+      // Non-J&T: process all in parallel
+      const nonJtPromises = nonJtItems.map((item) => trackOneBulk(item));
+      const nonJtResults = await Promise.all(nonJtPromises);
+
+      // J&T: process sequentially (one-by-one) due to CAPTCHA
+      const jtResults: BulkResultItem[] = [];
+      for (const item of jtItems) {
+        const res = await trackOneBulk(item);
+        jtResults.push(res);
+      }
+
+      const allResults = [...nonJtResults, ...jtResults];
+
+      // Apply ordering to each result
+      for (const item of allResults) {
+        if (item.result) applyOrder(item.result, order);
+      }
+
+      // Maintain original input order
+      const orderedResults: BulkResultItem[] = items.map((item) => {
+        const waybill = item.waybill.trim();
+        return allResults.find((r) => r.waybill === waybill) ?? { waybill, carrier: "unknown", error: { message: "Not processed" } };
+      });
+
+      return reply.send({
+        total: orderedResults.length,
+        successful: orderedResults.filter((r) => r.result?.found).length,
+        failed: orderedResults.filter((r) => r.error).length,
+        results: orderedResults,
+      });
+    }
+  );
+
+  // ----- benchmark endpoint -----
+
+  // POST /track/benchmark
+  fastify.post<{ Body: { waybills: (string | BulkItem)[]; lang?: string } }>(
+    "/track/benchmark",
+    {
+      schema: {
+        tags: ["tracking"],
+        summary: "Benchmark: compare processing time for 50 vs 100 tracking numbers",
+        body: {
+          type: "object",
+          required: ["waybills"],
+          properties: {
+            waybills: {
+              type: "array",
+              maxItems: 100,
+              items: {
+                oneOf: [
+                  { type: "string" },
+                  { type: "object", properties: { waybill: { type: "string" }, carrier: { type: "string" }, lang: { type: "string" } }, required: ["waybill"] },
+                ],
+              },
+              description: "Array of up to 100 waybill numbers. The first 50 are used for the 50-batch benchmark; all are used for the 100-batch benchmark.",
+            },
+            lang: { type: "string", description: "Default language for all waybills" },
+          },
+        },
+      },
+    },
+    async (req, reply) => {
+      const { waybills, lang: defaultLang } = req.body;
+      if (!waybills || waybills.length === 0) {
+        return reply.code(400).send({ error: "waybills array is required and must not be empty" });
+      }
+      if (waybills.length > 100) {
+        return reply.code(400).send({ error: "Maximum 100 waybills per request" });
+      }
+
+      // Normalize input
+      const items: BulkItem[] = waybills.map((w) =>
+        typeof w === "string" ? { waybill: w, lang: defaultLang } : { ...w, lang: w.lang ?? defaultLang }
+      );
+
+      // Helper: run a batch with J&T sequential, others parallel
+      async function runBatch(batch: BulkItem[]): Promise<{ results: BulkResultItem[]; durationMs: number }> {
+        const start = performance.now();
+
+        const jtBatch: BulkItem[] = [];
+        const nonJtBatch: BulkItem[] = [];
+
+        for (const item of batch) {
+          const carrierHint = item.carrier?.toLowerCase() ?? "auto";
+          let resolved: Carrier | null = null;
+          if (carrierHint !== "auto" && ALL_CARRIERS.includes(carrierHint as Carrier)) {
+            resolved = carrierHint as Carrier;
+          } else {
+            resolved = detectCarrier(item.waybill.trim());
+          }
+          if (resolved === "jt") {
+            jtBatch.push(item);
+          } else {
+            nonJtBatch.push(item);
+          }
+        }
+
+        // Non-J&T in parallel
+        const nonJtResults = await Promise.all(nonJtBatch.map((item) => trackOneBulk(item)));
+
+        // J&T sequential
+        const jtResults: BulkResultItem[] = [];
+        for (const item of jtBatch) {
+          jtResults.push(await trackOneBulk(item));
+        }
+
+        const durationMs = Math.round(performance.now() - start);
+        return { results: [...nonJtResults, ...jtResults], durationMs };
+      }
+
+      // Batch of 50 (first 50 items or all if less than 50)
+      const batch50 = items.slice(0, 50);
+      const result50 = await runBatch(batch50);
+
+      // Batch of 100 (all items)
+      const batch100 = items;
+      const result100 = await runBatch(batch100);
+
+      return reply.send({
+        benchmark: {
+          batch50: {
+            count: batch50.length,
+            durationMs: result50.durationMs,
+            successful: result50.results.filter((r) => r.result?.found).length,
+            failed: result50.results.filter((r) => r.error).length,
+            avgPerItem: Math.round(result50.durationMs / batch50.length),
+          },
+          batch100: {
+            count: batch100.length,
+            durationMs: result100.durationMs,
+            successful: result100.results.filter((r) => r.result?.found).length,
+            failed: result100.results.filter((r) => r.error).length,
+            avgPerItem: Math.round(result100.durationMs / batch100.length),
+          },
+          comparison: {
+            speedupRatio: result50.durationMs > 0 ? +(result100.durationMs / result50.durationMs).toFixed(2) : 0,
+            note: "speedupRatio shows how much longer 100 takes compared to 50. Values close to 1.0 mean good parallelism; close to 2.0 means linear scaling.",
+          },
+        },
+        results: result100.results,
+      });
+    }
+  );
+
   // ----- startup -----
   try {
     await fastify.listen({ port: PORT, host: HOST });
