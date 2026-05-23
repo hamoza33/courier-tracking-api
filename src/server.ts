@@ -3,8 +3,10 @@ import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 import { ALL_CARRIERS, CARRIER_NAMES, detectCarrier } from "./detect.js";
+import { buildMcpServer } from "./mcp.js";
 import { trackImile } from "./carriers/imile.js";
 import { trackInjaz } from "./carriers/injaz.js";
 import { trackJt } from "./carriers/jt.js";
@@ -114,6 +116,7 @@ async function start() {
         byCarrier: "GET /track/{carrier}/{waybill}",
         carriers: "GET /carriers",
         health: "GET /health",
+        mcp: "POST /mcp",
       },
       queryParams: {
         format: "'json' (default) or 'text' — text returns a step-by-step plain-text timeline.",
@@ -228,6 +231,74 @@ async function start() {
       return sendResult(req, reply, single, false);
     }
   );
+
+  // ----- MCP (Model Context Protocol) endpoint -----
+
+  const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+
+  // POST /mcp — Streamable HTTP transport, stateless (new server per request).
+  // Optional Bearer auth via the MCP_AUTH_TOKEN env var. If unset, the
+  // endpoint is open (useful for local dev). Excluded from rate limiting so
+  // that long-running tool batches are not throttled by the per-IP REST limit.
+  fastify.route({
+    method: "POST",
+    url: "/mcp",
+    config: { rateLimit: false },
+    schema: { hide: true },
+    handler: async (request, reply) => {
+      if (MCP_AUTH_TOKEN) {
+        const header = request.headers.authorization ?? "";
+        const match = /^Bearer\s+(.+)$/i.exec(header);
+        if (!match || match[1].trim() !== MCP_AUTH_TOKEN) {
+          reply.code(401).send({ error: "unauthorized" });
+          return;
+        }
+      }
+
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      const mcp = buildMcpServer();
+
+      reply.raw.on("close", () => {
+        void transport.close().catch(() => {});
+        void mcp.close().catch(() => {});
+      });
+
+      try {
+        await mcp.connect(transport);
+        reply.hijack();
+        await transport.handleRequest(request.raw, reply.raw, request.body);
+      } catch (err) {
+        fastify.log.error({ err }, "MCP request failed");
+        if (!reply.raw.headersSent) {
+          reply.raw.writeHead(500, { "content-type": "application/json" });
+          reply.raw.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              error: { code: -32000, message: "Internal MCP server error" },
+              id: null,
+            }),
+          );
+        } else {
+          reply.raw.end();
+        }
+      }
+    },
+  });
+
+  // GET /mcp — not supported in stateless Streamable HTTP mode.
+  fastify.route({
+    method: ["GET", "DELETE"],
+    url: "/mcp",
+    config: { rateLimit: false },
+    schema: { hide: true },
+    handler: async (_request, reply) => {
+      reply.code(405).send({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Method not allowed." },
+        id: null,
+      });
+    },
+  });
 
   // GET /track/:carrier/:waybill[?format=text&pretty=1&order=desc]
   fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string; format?: string; pretty?: string; order?: string } }>(
