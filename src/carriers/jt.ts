@@ -255,8 +255,10 @@ async function solveAndTrack(
   const captchaImages: Record<string, Buffer> = {};
   let trackingData: JtV2Response | null = null;
 
+  // Wait up to 60s for the upstream tracking response to come back
+  // after we solve the slider — the JT v2 API can take 20-40s server-side.
   const trackingPromise = new Promise<JtV2Response | null>((resolve) => {
-    const timer = setTimeout(() => resolve(null), 25000);
+    const timer = setTimeout(() => resolve(null), 60000);
     page.on("response", async (response) => {
       const url = response.url();
       if (url.includes("cap_union_new_getcapbysig")) {
@@ -283,15 +285,18 @@ async function solveAndTrack(
   try {
     await page.goto(`${JT_URL}?waybillNo=${waybillNo}`, {
       waitUntil: "domcontentloaded",
-      timeout: 30000,
+      timeout: 45000,
     });
+    // The Tencent captcha widget can take 20-40s to render on a cold
+    // container (TJNCaptcha-global.js + two image fetches). 15s was too
+    // tight in production and caused ~100% of JT calls to fail.
     await page.waitForSelector(".tencent-captcha-dy__fg-item", {
-      timeout: 15000,
+      timeout: 45000,
     });
-    await page.waitForTimeout(3000);
-
-    if (!captchaImages["0"] || !captchaImages["1"]) {
-      await page.waitForTimeout(3000);
+    // Give the captcha network calls time to land in our response hook.
+    for (let i = 0; i < 6; i++) {
+      if (captchaImages["0"] && captchaImages["1"]) break;
+      await page.waitForTimeout(2500);
     }
     if (!captchaImages["1"] || !captchaImages["0"]) {
       throw new Error("Failed to capture captcha images from network");
@@ -361,7 +366,10 @@ export async function trackJt(
 ): Promise<TrackResult> {
   const wb = waybillNo.trim();
 
-  const maxAttempts = 3;
+  // With the larger per-attempt timeouts (selector 45s + upstream 60s) each
+  // attempt can take up to ~70s end-to-end, so cap retries at 2 to stay
+  // well under the cod-whatsapp-notifications client timeout of 120s.
+  const maxAttempts = 2;
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
