@@ -4,6 +4,7 @@ import rateLimit from "@fastify/rate-limit";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 
+import { handleMcpRequest } from "./mcp.js";
 import { ALL_CARRIERS, CARRIER_NAMES, detectCarrier } from "./detect.js";
 import { trackImile } from "./carriers/imile.js";
 import { trackInjaz } from "./carriers/injaz.js";
@@ -648,6 +649,17 @@ async function start() {
       });
     }
   );
+
+  // ----- MCP endpoint (Streamable HTTP) -----
+  fastify.all("/mcp", { config: { rawBody: true } }, async (req, reply) => {
+    const raw = req.raw;
+    const rawRes = reply.raw;
+
+    // Prevent Fastify from auto-sending the reply
+    reply.hijack();
+
+    await handleMcpRequest(raw, rawRes, req.body);
+  });
 
   // ----- startup -----
   try {
