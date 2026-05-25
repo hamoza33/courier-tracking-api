@@ -3,8 +3,19 @@ import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
+import fastifyExpress from "@fastify/express";
+import express from "express";
+import type { Request as ExpressRequest } from "express";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  getOAuthProtectedResourceMetadataUrl,
+  mcpAuthRouter,
+} from "@modelcontextprotocol/sdk/server/auth/router.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 
 import { ALL_CARRIERS, CARRIER_NAMES, detectCarrier } from "./detect.js";
+import { buildMcpServer } from "./mcp.js";
+import { CourierMcpOAuthProvider } from "./oauth.js";
 import { trackImile } from "./carriers/imile.js";
 import { trackInjaz } from "./carriers/injaz.js";
 import { trackJt } from "./carriers/jt.js";
@@ -114,6 +125,7 @@ async function start() {
         byCarrier: "GET /track/{carrier}/{waybill}",
         carriers: "GET /carriers",
         health: "GET /health",
+        mcp: "POST /mcp",
       },
       queryParams: {
         format: "'json' (default) or 'text' — text returns a step-by-step plain-text timeline.",
@@ -228,6 +240,184 @@ async function start() {
       return sendResult(req, reply, single, false);
     }
   );
+
+  // ----- MCP (Model Context Protocol) endpoint -----
+
+  // The MCP endpoint is gated by OAuth 2.1 + PKCE + Dynamic Client Registration
+  // (required by ChatGPT custom MCP connectors). The static MCP_AUTH_TOKEN env
+  // var doubles as (a) the password on the OAuth login page and (b) a Bearer
+  // admin token accepted directly on /mcp for curl / Claude Desktop / Cursor.
+  const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+
+  if (MCP_AUTH_TOKEN) {
+    const publicUrl = process.env.MCP_PUBLIC_URL
+      ? new URL(process.env.MCP_PUBLIC_URL)
+      : new URL("https://courier-tracking-api.fly.dev");
+    const mcpResourceUrl = new URL("/mcp", publicUrl);
+
+    const oauth = new CourierMcpOAuthProvider(MCP_AUTH_TOKEN);
+
+    // Register @fastify/express so we can mount the MCP SDK's OAuth router
+    // (it ships as an Express router). The body parsers are scoped to the
+    // specific OAuth paths so they do not interfere with Fastify's own body
+    // parsing for the /track* and /mcp routes.
+    await fastify.register(fastifyExpress);
+    const OAUTH_PATHS = [
+      "/register",
+      "/token",
+      "/authorize",
+      "/revoke",
+      "/oauth/approve",
+    ];
+    for (const p of OAUTH_PATHS) {
+      fastify.use(p, express.json({ limit: "256kb" }));
+      fastify.use(p, express.urlencoded({ extended: false, limit: "256kb" }));
+    }
+    fastify.use(
+      mcpAuthRouter({
+        provider: oauth,
+        issuerUrl: publicUrl,
+        resourceServerUrl: mcpResourceUrl,
+        scopesSupported: ["mcp:tools"],
+        resourceName: "Courier Tracking MCP",
+      }),
+    );
+    fastify.use("/oauth/approve", oauth.approveHandler);
+
+    const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(mcpResourceUrl);
+
+    // POST /mcp — Streamable HTTP transport, stateless (fresh server per request).
+    // Accept either the admin Bearer token (== MCP_AUTH_TOKEN) or a real OAuth
+    // access token issued via the authorization code flow.
+    fastify.route({
+      method: "POST",
+      url: "/mcp",
+      config: { rateLimit: false },
+      schema: { hide: true },
+      handler: async (request, reply) => {
+        const header = request.headers.authorization ?? "";
+        const m = /^Bearer\s+(.+)$/i.exec(header);
+        const presented = m?.[1]?.trim();
+
+        let auth: AuthInfo | undefined;
+
+        if (presented && oauth.isAdminToken(presented)) {
+          auth = {
+            token: presented,
+            clientId: "admin",
+            scopes: ["mcp:tools"],
+            expiresAt: Math.floor(Date.now() / 1000) + 3600,
+          };
+        } else if (presented) {
+          try {
+            auth = await oauth.verifyAccessToken(presented);
+          } catch {
+            // fall through to 401
+          }
+        }
+
+        if (!auth) {
+          reply.code(401).header(
+            "www-authenticate",
+            `Bearer realm="Courier Tracking MCP", resource_metadata="${resourceMetadataUrl}"`,
+          );
+          reply.send({ error: "unauthorized" });
+          return;
+        }
+
+        (request.raw as ExpressRequest & { auth?: AuthInfo }).auth = auth;
+
+        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+        const mcp = buildMcpServer();
+
+        reply.raw.on("close", () => {
+          void transport.close().catch(() => {});
+          void mcp.close().catch(() => {});
+        });
+
+        try {
+          await mcp.connect(transport);
+          reply.hijack();
+          await transport.handleRequest(request.raw, reply.raw, request.body);
+        } catch (err) {
+          fastify.log.error({ err }, "MCP request failed");
+          if (!reply.raw.headersSent) {
+            reply.raw.writeHead(500, { "content-type": "application/json" });
+            reply.raw.end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                error: { code: -32000, message: "Internal MCP server error" },
+                id: null,
+              }),
+            );
+          } else if (!reply.raw.writableEnded) {
+            reply.raw.end();
+          }
+        }
+      },
+    });
+
+    // GET/DELETE /mcp — not supported in stateless Streamable HTTP mode.
+    fastify.route({
+      method: ["GET", "DELETE"],
+      url: "/mcp",
+      config: { rateLimit: false },
+      schema: { hide: true },
+      handler: async (_request, reply) => {
+        reply.code(405).send({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Method not allowed." },
+          id: null,
+        });
+      },
+    });
+  } else {
+    // MCP_AUTH_TOKEN not set — expose an open /mcp for local dev only.
+    fastify.route({
+      method: "POST",
+      url: "/mcp",
+      config: { rateLimit: false },
+      schema: { hide: true },
+      handler: async (request, reply) => {
+        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+        const mcp = buildMcpServer();
+        reply.raw.on("close", () => {
+          void transport.close().catch(() => {});
+          void mcp.close().catch(() => {});
+        });
+        try {
+          await mcp.connect(transport);
+          reply.hijack();
+          await transport.handleRequest(request.raw, reply.raw, request.body);
+        } catch (err) {
+          fastify.log.error({ err }, "MCP request failed");
+          if (!reply.raw.headersSent) {
+            reply.raw.writeHead(500, { "content-type": "application/json" });
+            reply.raw.end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                error: { code: -32000, message: "Internal MCP server error" },
+                id: null,
+              }),
+            );
+          }
+        }
+      },
+    });
+    fastify.route({
+      method: ["GET", "DELETE"],
+      url: "/mcp",
+      config: { rateLimit: false },
+      schema: { hide: true },
+      handler: async (_request, reply) => {
+        reply.code(405).send({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Method not allowed." },
+          id: null,
+        });
+      },
+    });
+  }
 
   // GET /track/:carrier/:waybill[?format=text&pretty=1&order=desc]
   fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string; format?: string; pretty?: string; order?: string } }>(
