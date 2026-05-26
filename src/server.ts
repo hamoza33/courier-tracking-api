@@ -629,14 +629,14 @@ async function start() {
     {
       schema: {
         tags: ["tracking"],
-        summary: "Track up to 100 waybills at once. J&T waybills are processed sequentially (CAPTCHA).",
+        summary: "Track up to 250 waybills at once. J&T waybills are processed sequentially (CAPTCHA).",
         body: {
           type: "object",
           required: ["waybills"],
           properties: {
             waybills: {
               type: "array",
-              maxItems: 100,
+              maxItems: 250,
               items: {
                 oneOf: [
                   { type: "string", description: "Waybill number (carrier auto-detected)" },
@@ -651,7 +651,7 @@ async function start() {
                   },
                 ],
               },
-              description: "Array of waybill numbers or objects with waybill + optional carrier/lang. Max 100.",
+              description: "Array of waybill numbers or objects with waybill + optional carrier/lang. Max 250.",
             },
             lang: { type: "string", description: "Default language for all waybills" },
             order: { type: "string", enum: ["desc", "asc"], description: "Event sort order (default: desc)" },
@@ -664,8 +664,8 @@ async function start() {
       if (!waybills || waybills.length === 0) {
         return reply.code(400).send({ error: "waybills array is required and must not be empty" });
       }
-      if (waybills.length > 100) {
-        return reply.code(400).send({ error: "Maximum 100 waybills per request" });
+      if (waybills.length > 250) {
+        return reply.code(400).send({ error: "Maximum 250 waybills per request" });
       }
 
       const order = (orderParam ?? "desc") === "asc" ? "asc" as const : "desc" as const;
@@ -735,21 +735,21 @@ async function start() {
     {
       schema: {
         tags: ["tracking"],
-        summary: "Benchmark: compare processing time for 50 vs 100 tracking numbers",
+        summary: "Benchmark: compare processing time for 50 vs 250 tracking numbers",
         body: {
           type: "object",
           required: ["waybills"],
           properties: {
             waybills: {
               type: "array",
-              maxItems: 100,
+              maxItems: 250,
               items: {
                 oneOf: [
                   { type: "string" },
                   { type: "object", properties: { waybill: { type: "string" }, carrier: { type: "string" }, lang: { type: "string" } }, required: ["waybill"] },
                 ],
               },
-              description: "Array of up to 100 waybill numbers. The first 50 are used for the 50-batch benchmark; all are used for the 100-batch benchmark.",
+              description: "Array of up to 250 waybill numbers. The first 50 are used for the 50-batch benchmark; all are used for the full-batch benchmark.",
             },
             lang: { type: "string", description: "Default language for all waybills" },
           },
@@ -761,8 +761,8 @@ async function start() {
       if (!waybills || waybills.length === 0) {
         return reply.code(400).send({ error: "waybills array is required and must not be empty" });
       }
-      if (waybills.length > 100) {
-        return reply.code(400).send({ error: "Maximum 100 waybills per request" });
+      if (waybills.length > 250) {
+        return reply.code(400).send({ error: "Maximum 250 waybills per request" });
       }
 
       // Normalize input

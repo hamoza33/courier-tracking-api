@@ -58,7 +58,7 @@ Same as above but with the carrier as a path parameter.
 
 ### `POST /track/bulk`
 
-Track up to **100 waybills** in a single request. All carriers except J&T Express
+Track up to **250 waybills** in a single request. All carriers except J&T Express
 are processed in parallel. J&T waybills are processed **one-by-one** (sequentially)
 to handle the CAPTCHA requirement.
 
@@ -100,7 +100,7 @@ Each item in `waybills` can be a plain string (carrier auto-detected) or an obje
 
 ### `POST /track/benchmark`
 
-Benchmarks processing time for **50 vs 100** tracking numbers. Provide up to 100
+Benchmarks processing time for **50 vs all** tracking numbers. Provide up to 250
 waybills; the endpoint runs the first 50, then all provided waybills, and
 returns timing comparisons.
 

@@ -7,7 +7,7 @@
  *
  * Tools:
  *   - track_waybill   — track a single waybill (auto-detect carrier or override)
- *   - track_bulk      — track up to 100 waybills in a single call
+ *   - track_bulk      — track up to 250 waybills in a single call
  *   - list_carriers   — list supported carriers
  *   - detect_carrier  — preview which carrier the auto-detector would pick
  *
@@ -111,7 +111,7 @@ export function buildMcpServer(): McpServer {
     },
     {
       instructions:
-        "Aggregator MCP server for five Middle-East courier services (iMile, Injaz Express, J&T Express, JDW Logistics, Naqel Express). Use `track_waybill` for a single shipment, `track_bulk` for up to 100 at once, `list_carriers` to discover supported carriers, and `detect_carrier` to preview auto-detection. Backed by https://courier-tracking-api.fly.dev.",
+        "Aggregator MCP server for five Middle-East courier services (iMile, Injaz Express, J&T Express, JDW Logistics, Naqel Express). Use `track_waybill` for a single shipment, `track_bulk` for up to 250 at once, `list_carriers` to discover supported carriers, and `detect_carrier` to preview auto-detection. Backed by https://courier-tracking-api.fly.dev.",
     },
   );
 
@@ -219,7 +219,7 @@ export function buildMcpServer(): McpServer {
     {
       title: "Track multiple waybills",
       description:
-        "Track up to 100 waybills in a single call. Non-J&T waybills are processed in parallel; J&T waybills are processed sequentially because of CAPTCHA.",
+        "Track up to 250 waybills in a single call. Non-J&T waybills are processed in parallel; J&T waybills are processed sequentially because of CAPTCHA.",
       inputSchema: {
         waybills: z
           .array(
@@ -233,9 +233,9 @@ export function buildMcpServer(): McpServer {
             ]),
           )
           .min(1)
-          .max(100)
+          .max(250)
           .describe(
-            "Array of waybill numbers (strings) or { waybill, carrier?, lang? } objects. Up to 100 items.",
+            "Array of waybill numbers (strings) or { waybill, carrier?, lang? } objects. Up to 250 items.",
           ),
         lang: z.string().optional().describe("Default language for all waybills."),
         order: z.enum(ORDER_VALUES).optional().describe("Event sort order. Default 'desc'."),
