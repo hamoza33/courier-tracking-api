@@ -28,6 +28,7 @@ import {
   normalizeForJson,
   type FormatOptions,
 } from "./format.js";
+import { DASHBOARD_HTML } from "./dashboard.js";
 
 type MultiTrackResult = { carrier: string; result?: TrackResult; error?: { message: string; captchaRequired?: boolean } };
 
@@ -126,6 +127,7 @@ async function start() {
         carriers: "GET /carriers",
         health: "GET /health",
         mcp: "POST /mcp",
+        dashboard: "GET /dashboard",
       },
       queryParams: {
         format: "'json' (default) or 'text' — text returns a step-by-step plain-text timeline.",
@@ -141,6 +143,14 @@ async function start() {
     "/health",
     { schema: { tags: ["meta"], summary: "Liveness probe" } },
     async () => ({ status: "ok", time: new Date().toISOString() })
+  );
+
+  fastify.get(
+    "/dashboard",
+    { schema: { hide: true } },
+    async (_req, reply) => {
+      reply.type("text/html").send(DASHBOARD_HTML);
+    }
   );
 
   fastify.get(
