@@ -18,6 +18,10 @@ are normalised across carriers (`events[]`, `latestStatus`, `latestTime`,
 
 A live OpenAPI / Swagger UI is served at **`/docs`**.
 
+A **tracking dashboard** is available at **`/dashboard`** — paste or upload
+tracking numbers in bulk, view results in a sortable/filterable table, and
+refresh statuses on demand.
+
 **Live deployment:** https://courier-tracking-api.fly.dev
 
 ---
@@ -133,6 +137,20 @@ Liveness probe.
 ### `GET /docs`
 
 Interactive Swagger UI.
+
+### `GET /dashboard`
+
+Bulk tracking dashboard UI. Features:
+
+- **Paste or upload** tracking numbers (one per line, comma/space separated, or CSV/TXT file)
+- **Sortable table** with columns: #, Tracking Number, Carrier, Status, Last Update, Details
+- **Search** across tracking number, carrier, and status in real time
+- **Filter** by status (Delivered, In Transit, Out for Delivery, Returned, Error) and carrier
+- **Summary bar** showing counts per status category
+- **Bulk refresh** — re-track all numbers with one click
+- **Event timeline** — expand any row to see the full tracking history
+
+**Live:** [https://courier-tracking-api.fly.dev/dashboard](https://courier-tracking-api.fly.dev/dashboard)
 
 ---
 
