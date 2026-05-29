@@ -2,6 +2,13 @@
  * Self-contained dashboard HTML served as an inline string.
  * Provides bulk tracking input (paste / CSV upload), a sortable &
  * filterable results table, and a one-click bulk refresh.
+ *
+ * Features:
+ * - Auto-load waybills from URL params (?waybills=...) on page load
+ * - Graceful failure handling with retry logic and timeout
+ * - Full order data shape (extra fields, warnings, origin/dest)
+ * - localStorage persistence for recently tracked numbers
+ * - API health indicator
  */
 
 export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
@@ -17,6 +24,16 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   .container{max-width:1200px;margin:0 auto;padding:1.5rem}
   h1{font-size:1.5rem;font-weight:700;margin-bottom:.25rem}
   .subtitle{color:var(--muted);font-size:.875rem;margin-bottom:1.5rem}
+
+  /* API Status */
+  .api-status{display:inline-flex;align-items:center;gap:.375rem;font-size:.75rem;padding:2px 10px;border-radius:999px;margin-left:.75rem;vertical-align:middle}
+  .api-status.online{background:#dcfce7;color:#166534}
+  .api-status.offline{background:#fee2e2;color:#991b1b}
+  .api-status.checking{background:#fef3c7;color:#92400e}
+  .api-dot{width:6px;height:6px;border-radius:50%;display:inline-block}
+  .api-status.online .api-dot{background:#16a34a}
+  .api-status.offline .api-dot{background:#dc2626}
+  .api-status.checking .api-dot{background:#ea580c}
 
   /* Input Card */
   .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:1.25rem;margin-bottom:1rem}
@@ -40,6 +57,12 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   .progress-bar.active{display:block}
   .progress-fill{height:100%;background:var(--accent);border-radius:2px;transition:width .3s}
   .status-msg{font-size:.8125rem;color:var(--muted);margin-top:.375rem;min-height:1.25rem}
+  .status-msg.error{color:var(--red)}
+
+  /* Error banner */
+  .error-banner{display:none;background:#fef2f2;border:1px solid #fecaca;border-radius:var(--radius);padding:.75rem 1rem;margin-bottom:1rem;font-size:.8125rem;color:#991b1b}
+  .error-banner.visible{display:flex;align-items:center;gap:.5rem}
+  .error-banner .dismiss{margin-left:auto;cursor:pointer;font-weight:700;font-size:1rem;line-height:1;color:#991b1b;background:none;border:none}
 
   /* Controls Bar */
   .controls{display:flex;gap:.625rem;align-items:center;flex-wrap:wrap;margin-bottom:.75rem}
@@ -86,6 +109,9 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 
   .error-cell{color:var(--red);font-size:.75rem}
   .time-cell{white-space:nowrap;font-size:.75rem;color:var(--muted)}
+  .extra-info{font-size:.6875rem;color:var(--muted);margin-top:2px}
+  .extra-tag{display:inline-block;padding:1px 5px;border-radius:3px;background:#f0f0f0;color:#555;font-size:.6875rem;margin-right:3px;margin-top:2px}
+  .warning-tag{display:inline-block;padding:1px 5px;border-radius:3px;background:#fef3c7;color:#92400e;font-size:.6875rem;margin-right:3px;margin-top:2px}
 
   @media(max-width:768px){
     .controls{flex-direction:column}
@@ -96,8 +122,13 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 </head>
 <body>
 <div class="container">
-  <h1>Courier Tracking Dashboard</h1>
+  <h1>Courier Tracking Dashboard <span class="api-status checking" id="apiStatus"><span class="api-dot"></span> Checking...</span></h1>
   <p class="subtitle">Paste or upload tracking numbers, then track them all at once.</p>
+
+  <div class="error-banner" id="errorBanner">
+    <span id="errorBannerMsg"></span>
+    <button class="dismiss" onclick="dismissError()">&times;</button>
+  </div>
 
   <div class="card">
     <h2>Tracking Numbers</h2>
@@ -123,7 +154,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <div class="summary" id="summary"></div>
 
     <div class="controls">
-      <input type="text" class="search-input" id="searchInput" placeholder="Search by tracking number, carrier, or status..." oninput="applyFilters()"/>
+      <input type="text" class="search-input" id="searchInput" placeholder="Search by tracking number, carrier, status, or location..." oninput="applyFilters()"/>
       <select id="statusFilter" onchange="applyFilters()">
         <option value="">All Statuses</option>
         <option value="Delivered">Delivered</option>
@@ -150,6 +181,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
             <th onclick="sortTable('carrier')">Carrier <span class="sort-icon"></span></th>
             <th onclick="sortTable('status')">Status <span class="sort-icon"></span></th>
             <th onclick="sortTable('lastUpdate')">Last Update <span class="sort-icon"></span></th>
+            <th>Origin / Dest</th>
             <th>Details</th>
           </tr>
         </thead>
@@ -163,6 +195,10 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 let allResults = [];
 let sortKey = 'index';
 let sortDir = 'asc';
+let apiOnline = null;
+const STORAGE_KEY = 'courier_dashboard_waybills';
+const MAX_RETRIES = 2;
+const REQUEST_TIMEOUT_MS = 120000;
 
 function parseWaybills(text) {
   return text
@@ -197,6 +233,83 @@ function clearAll() {
   allResults = [];
   document.getElementById('resultsSection').style.display = 'none';
   document.getElementById('statusMsg').textContent = '';
+  document.getElementById('statusMsg').classList.remove('error');
+  dismissError();
+}
+
+function showError(msg) {
+  const banner = document.getElementById('errorBanner');
+  document.getElementById('errorBannerMsg').textContent = msg;
+  banner.classList.add('visible');
+}
+
+function dismissError() {
+  document.getElementById('errorBanner').classList.remove('visible');
+}
+
+async function checkApiHealth() {
+  const el = document.getElementById('apiStatus');
+  el.className = 'api-status checking';
+  el.innerHTML = '<span class="api-dot"></span> Checking...';
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const resp = await fetch('/health', { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (resp.ok) {
+      el.className = 'api-status online';
+      el.innerHTML = '<span class="api-dot"></span> Online';
+      apiOnline = true;
+    } else {
+      throw new Error('Health check returned ' + resp.status);
+    }
+  } catch (err) {
+    el.className = 'api-status offline';
+    el.innerHTML = '<span class="api-dot"></span> Unreachable';
+    apiOnline = false;
+  }
+  return apiOnline;
+}
+
+async function fetchWithRetry(url, options, retries) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+      const resp = await fetch(url, { ...options, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!resp.ok && resp.status >= 500 && attempt < retries) {
+        lastErr = new Error('Server returned ' + resp.status);
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      return resp;
+    } catch (err) {
+      lastErr = err;
+      if (err.name === 'AbortError') {
+        lastErr = new Error('Request timed out after ' + (REQUEST_TIMEOUT_MS / 1000) + 's');
+      }
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+    }
+  }
+  throw lastErr || new Error('Request failed after ' + (retries + 1) + ' attempts');
+}
+
+function saveWaybills(waybills) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(waybills.slice(0, 250)));
+  } catch (e) { /* ignore quota errors */ }
+}
+
+function loadSavedWaybills() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    return saved ? JSON.parse(saved) : [];
+  } catch (e) { return []; }
 }
 
 async function startTracking() {
@@ -211,6 +324,9 @@ async function startTracking() {
     return;
   }
 
+  dismissError();
+  saveWaybills(waybills);
+
   const trackBtn = document.getElementById('trackBtn');
   const refreshBtn = document.getElementById('refreshBtn');
   trackBtn.disabled = true;
@@ -218,11 +334,11 @@ async function startTracking() {
   const bar = document.getElementById('progressBar');
   const fill = document.getElementById('progressFill');
   const msg = document.getElementById('statusMsg');
+  msg.classList.remove('error');
   bar.classList.add('active');
   fill.style.width = '10%';
   msg.textContent = 'Tracking ' + waybills.length + ' waybill(s)...';
 
-  // Animate progress bar
   let progress = 10;
   const timer = setInterval(() => {
     progress = Math.min(progress + Math.random() * 8, 90);
@@ -230,40 +346,73 @@ async function startTracking() {
   }, 500);
 
   try {
-    const resp = await fetch('/track/bulk', {
+    const resp = await fetchWithRetry('/track/bulk', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ waybills, order: 'desc' }),
-    });
+    }, MAX_RETRIES);
+
     const data = await resp.json();
     clearInterval(timer);
     fill.style.width = '100%';
 
     if (data.error) {
       msg.textContent = 'Error: ' + data.error;
+      msg.classList.add('error');
       trackBtn.disabled = false;
       refreshBtn.disabled = false;
       return;
     }
 
-    allResults = (data.results || []).map((r, i) => ({
-      index: i + 1,
-      waybill: r.waybill,
-      carrier: r.carrier || 'unknown',
-      carrierName: r.result?.carrierName || r.carrier || 'Unknown',
-      status: r.result?.normalizedStatus || (r.error ? 'Error' : 'Unknown'),
-      latestStatus: r.result?.latestStatus || (r.error?.message) || '—',
-      lastUpdate: r.result?.latestTime || null,
-      found: r.result?.found || false,
-      events: r.result?.events || [],
-      error: r.error || null,
-    }));
+    allResults = (data.results || []).map((r, i) => {
+      const extra = r.result?.extra || {};
+      const warnings = r.result?.warnings || [];
+      return {
+        index: i + 1,
+        waybill: r.waybill,
+        carrier: r.carrier || 'unknown',
+        carrierName: r.result?.carrierName || r.carrier || 'Unknown',
+        status: r.result?.normalizedStatus || (r.error ? 'Error' : 'Unknown'),
+        latestStatus: r.result?.latestStatus || (r.error?.message) || '\\u2014',
+        lastUpdate: r.result?.latestTime || null,
+        found: r.result?.found || false,
+        events: r.result?.events || [],
+        error: r.error || null,
+        extra: extra,
+        warnings: warnings,
+        origin: extra.sendSite || extra.originCity || extra.senderCity || null,
+        destination: extra.dispatchStation || extra.destCity || extra.receiverCity || null,
+        country: extra.country || null,
+      };
+    });
 
-    msg.textContent = 'Done — ' + data.successful + ' found, ' + data.failed + ' failed out of ' + data.total + '.';
+    msg.textContent = 'Done \\u2014 ' + data.successful + ' found, ' + data.failed + ' failed out of ' + data.total + '.';
+
+    checkApiHealth();
     renderResults();
   } catch (err) {
     clearInterval(timer);
+    fill.style.width = '0%';
+    bar.classList.remove('active');
+
+    const isNetwork = err.message.includes('Failed to fetch') || err.message.includes('NetworkError') || err.message.includes('timed out');
+    if (isNetwork) {
+      msg.textContent = 'API unreachable \\u2014 the tracking server may be starting up. Please try again in a moment.';
+      msg.classList.add('error');
+      showError('Could not connect to the tracking API. The server may be cold-starting (auto_stop is enabled). Retrying automatically...');
+      checkApiHealth();
+      setTimeout(() => {
+        dismissError();
+        msg.textContent = 'Retrying...';
+        trackBtn.disabled = false;
+        refreshBtn.disabled = false;
+        startTracking();
+      }, 5000);
+      return;
+    }
+
     msg.textContent = 'Request failed: ' + err.message;
+    msg.classList.add('error');
   }
 
   setTimeout(() => { bar.classList.remove('active'); }, 1000);
@@ -318,13 +467,12 @@ function applyFilters() {
     }
     if (carrierF && r.carrier !== carrierF) return false;
     if (search) {
-      const hay = (r.waybill + ' ' + r.carrier + ' ' + r.carrierName + ' ' + r.status + ' ' + r.latestStatus).toLowerCase();
+      const hay = (r.waybill + ' ' + r.carrier + ' ' + r.carrierName + ' ' + r.status + ' ' + r.latestStatus + ' ' + (r.origin || '') + ' ' + (r.destination || '') + ' ' + (r.country || '')).toLowerCase();
       if (!hay.includes(search)) return false;
     }
     return true;
   });
 
-  // Sort
   filtered.sort((a, b) => {
     let va, vb;
     switch (sortKey) {
@@ -350,7 +498,6 @@ function sortTable(key) {
     sortKey = key;
     sortDir = 'asc';
   }
-  // Update sort icons
   document.querySelectorAll('th .sort-icon').forEach(el => el.textContent = '');
   const idx = ['index','waybill','carrier','status','lastUpdate'].indexOf(key);
   if (idx >= 0) {
@@ -372,7 +519,7 @@ function statusBadge(status) {
 }
 
 function formatTime(iso) {
-  if (!iso) return '<span class="time-cell">—</span>';
+  if (!iso) return '<span class="time-cell">\\u2014</span>';
   try {
     const d = new Date(iso);
     const date = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
@@ -387,10 +534,28 @@ function escHtml(s) {
   return div.innerHTML;
 }
 
+function renderExtraInfo(r) {
+  const parts = [];
+  if (r.origin) parts.push('<span class="extra-tag">From: ' + escHtml(r.origin) + '</span>');
+  if (r.destination) parts.push('<span class="extra-tag">To: ' + escHtml(r.destination) + '</span>');
+  if (r.country) parts.push('<span class="extra-tag">' + escHtml(r.country) + '</span>');
+  if (r.warnings && r.warnings.length > 0) {
+    r.warnings.forEach(w => parts.push('<span class="warning-tag">' + escHtml(w) + '</span>'));
+  }
+  const extraKeys = Object.keys(r.extra || {}).filter(k => !['sendSite','dispatchStation','country','originCity','destCity','senderCity','receiverCity'].includes(k));
+  extraKeys.forEach(k => {
+    const v = r.extra[k];
+    if (v !== null && v !== undefined && v !== '') {
+      parts.push('<span class="extra-tag">' + escHtml(k) + ': ' + escHtml(String(v)) + '</span>');
+    }
+  });
+  return parts.length > 0 ? '<div class="extra-info">' + parts.join('') + '</div>' : '';
+}
+
 function renderTable(rows) {
   const tbody = document.getElementById('resultsBody');
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No results match your filters.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No results match your filters.</td></tr>';
     return;
   }
 
@@ -400,17 +565,23 @@ function renderTable(rows) {
     let detailHtml = '';
     if (r.error) {
       detailHtml = '<span class="error-cell">' + escHtml(r.error.message) + '</span>';
+      if (r.error.captchaRequired) {
+        detailHtml += '<br/><span class="warning-tag">CAPTCHA required</span>';
+      }
     } else if (r.events.length > 0) {
       detailHtml = '<span class="events-toggle" onclick="toggleEvents(\\'' + eventsId + '\\')">' + r.events.length + ' event(s)</span>';
       detailHtml += '<div class="events-detail" id="' + eventsId + '">';
       for (const ev of r.events) {
         const t = ev.time ? new Date(ev.time).toLocaleString('en-GB', {day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) : '';
-        detailHtml += '<div class="event-row"><b>' + escHtml(ev.status || '—') + '</b> ' + t + (ev.location ? ' @ ' + escHtml(ev.location) : '') + '<br/>' + escHtml(ev.description) + '</div>';
+        const step = ev.step ? '<span class="extra-tag">#' + ev.step + '</span> ' : '';
+        detailHtml += '<div class="event-row">' + step + '<b>' + escHtml(ev.status || '\\u2014') + '</b> ' + t + (ev.location ? ' @ ' + escHtml(ev.location) : '') + '<br/>' + escHtml(ev.description) + '</div>';
       }
       detailHtml += '</div>';
     } else {
       detailHtml = '<span class="time-cell">No events</span>';
     }
+
+    const originDest = renderExtraInfo(r);
 
     html += '<tr>' +
       '<td>' + r.index + '</td>' +
@@ -418,6 +589,7 @@ function renderTable(rows) {
       '<td><span class="carrier-tag">' + escHtml(r.carrierName) + '</span></td>' +
       '<td>' + statusBadge(r.status) + '<br/><span style="font-size:.7rem;color:var(--muted)">' + escHtml(r.latestStatus) + '</span></td>' +
       '<td>' + formatTime(r.lastUpdate) + '</td>' +
+      '<td>' + originDest + '</td>' +
       '<td>' + detailHtml + '</td>' +
       '</tr>';
   }
@@ -428,6 +600,29 @@ function toggleEvents(id) {
   const el = document.getElementById(id);
   if (el) el.classList.toggle('open');
 }
+
+(async function init() {
+  checkApiHealth();
+
+  const params = new URLSearchParams(window.location.search);
+  const urlWaybills = params.get('waybills') || params.get('waybill') || params.get('w');
+
+  if (urlWaybills) {
+    const nums = urlWaybills.split(/[,;\\s]+/).map(s => s.trim()).filter(Boolean);
+    if (nums.length > 0) {
+      document.getElementById('waybillInput').value = nums.join('\\n');
+      updateCounter();
+      startTracking();
+      return;
+    }
+  }
+
+  const saved = loadSavedWaybills();
+  if (saved.length > 0) {
+    document.getElementById('waybillInput').value = saved.join('\\n');
+    updateCounter();
+  }
+})();
 </script>
 </body>
 </html>`;
