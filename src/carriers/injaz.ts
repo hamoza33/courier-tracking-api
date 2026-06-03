@@ -54,7 +54,7 @@ export async function trackInjaz(waybillNo: string): Promise<TrackResult> {
   events.reverse();
 
   const latestEvent = events[0];
-  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description) : null;
+  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description, "injaz") : null;
 
   return {
     carrier: "injaz",

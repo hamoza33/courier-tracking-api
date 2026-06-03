@@ -68,7 +68,7 @@ export async function trackNaqel(waybillNo: string): Promise<TrackResult> {
 
   const latestEvent = events[0];
   const ns = latestEvent
-    ? normalizeStatus(latestEvent.status, latestEvent.description)
+    ? normalizeStatus(latestEvent.status, latestEvent.description, "naqel")
     : null;
 
   return {

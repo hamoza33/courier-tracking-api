@@ -91,7 +91,7 @@ export async function trackImile(waybillNo: string, lang = "en-US"): Promise<Tra
   }));
 
   const latestEvent = events[0];
-  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description) : null;
+  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description, "imile") : null;
 
   return {
     carrier: "imile",
