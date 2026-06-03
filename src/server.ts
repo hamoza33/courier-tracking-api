@@ -262,7 +262,7 @@ async function start() {
   if (MCP_AUTH_TOKEN) {
     const publicUrl = process.env.MCP_PUBLIC_URL
       ? new URL(process.env.MCP_PUBLIC_URL)
-      : new URL("https://courier-tracking-api.fly.dev");
+      : new URL("https://tracking.shopinzo.bond");
     const mcpResourceUrl = new URL("/mcp", publicUrl);
 
     const oauth = new CourierMcpOAuthProvider(MCP_AUTH_TOKEN);

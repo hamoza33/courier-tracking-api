@@ -111,7 +111,7 @@ export function buildMcpServer(): McpServer {
     },
     {
       instructions:
-        "Aggregator MCP server for five Middle-East courier services (iMile, Injaz Express, J&T Express, JDW Logistics, Naqel Express). Use `track_waybill` for a single shipment, `track_bulk` for up to 250 at once, `list_carriers` to discover supported carriers, and `detect_carrier` to preview auto-detection. Backed by https://courier-tracking-api.fly.dev.",
+        "Aggregator MCP server for five Middle-East courier services (iMile, Injaz Express, J&T Express, JDW Logistics, Naqel Express). Use `track_waybill` for a single shipment, `track_bulk` for up to 250 at once, `list_carriers` to discover supported carriers, and `detect_carrier` to preview auto-detection. Backed by https://tracking.shopinzo.bond.",
     },
   );
 

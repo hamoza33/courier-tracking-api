@@ -22,7 +22,7 @@ A **tracking dashboard** is available at **`/dashboard`** — paste or upload
 tracking numbers in bulk, view results in a sortable/filterable table, and
 refresh statuses on demand.
 
-**Live deployment:** https://courier-tracking-api.fly.dev
+**Live deployment:** https://tracking.shopinzo.bond
 
 ---
 
@@ -150,7 +150,7 @@ Bulk tracking dashboard UI. Features:
 - **Bulk refresh** — re-track all numbers with one click
 - **Event timeline** — expand any row to see the full tracking history
 
-**Live:** [https://courier-tracking-api.fly.dev/dashboard](https://courier-tracking-api.fly.dev/dashboard)
+**Live:** [https://tracking.shopinzo.bond/dashboard](https://tracking.shopinzo.bond/dashboard)
 
 ---
 
@@ -183,7 +183,7 @@ This applies to both the JSON response and `?format=text` output.
 To get the old behavior (oldest first), append `?order=asc`:
 
 ```bash
-curl -s "https://courier-tracking-api.fly.dev/track/imile/6050926815554?order=asc" | jq '.events[0].time'
+curl -s "https://tracking.shopinzo.bond/track/imile/6050926815554?order=asc" | jq '.events[0].time'
 ```
 
 ---
@@ -244,38 +244,38 @@ J&T now uses a v2 API endpoint:
 ### Auto-detect (JSON)
 
 ```bash
-curl -s https://courier-tracking-api.fly.dev/track?waybill=6050926815554 | jq
-curl -s https://courier-tracking-api.fly.dev/track?waybill=JDW101107292775 | jq
-curl -s https://courier-tracking-api.fly.dev/track?waybill=INJAZ78226736 | jq
-curl -s https://courier-tracking-api.fly.dev/track?waybill=397965386 | jq
+curl -s https://tracking.shopinzo.bond/track?waybill=6050926815554 | jq
+curl -s https://tracking.shopinzo.bond/track?waybill=JDW101107292775 | jq
+curl -s https://tracking.shopinzo.bond/track?waybill=INJAZ78226736 | jq
+curl -s https://tracking.shopinzo.bond/track?waybill=397965386 | jq
 ```
 
 ### Plain-text timeline
 
 ```bash
-curl -s "https://courier-tracking-api.fly.dev/track/imile/6050926815554?format=text"
+curl -s "https://tracking.shopinzo.bond/track/imile/6050926815554?format=text"
 ```
 
 ### Force carrier
 
 ```bash
-curl -s https://courier-tracking-api.fly.dev/track/imile/6050926815554 | jq
-curl -s https://courier-tracking-api.fly.dev/track/jdw/JDW101107292775 | jq
-curl -s https://courier-tracking-api.fly.dev/track/injaz/INJAZ78226736 | jq
-curl -s https://courier-tracking-api.fly.dev/track/jt/JTE000944462953 | jq
-curl -s https://courier-tracking-api.fly.dev/track/naqel/397965386 | jq
+curl -s https://tracking.shopinzo.bond/track/imile/6050926815554 | jq
+curl -s https://tracking.shopinzo.bond/track/jdw/JDW101107292775 | jq
+curl -s https://tracking.shopinzo.bond/track/injaz/INJAZ78226736 | jq
+curl -s https://tracking.shopinzo.bond/track/jt/JTE000944462953 | jq
+curl -s https://tracking.shopinzo.bond/track/naqel/397965386 | jq
 ```
 
 ### Fan-out
 
 ```bash
-curl -s "https://courier-tracking-api.fly.dev/track?waybill=6050926815554&carrier=all" | jq
+curl -s "https://tracking.shopinzo.bond/track?waybill=6050926815554&carrier=all" | jq
 ```
 
 ### Oldest-first ordering
 
 ```bash
-curl -s "https://courier-tracking-api.fly.dev/track/imile/6050926815554?order=asc" | jq
+curl -s "https://tracking.shopinzo.bond/track/imile/6050926815554?order=asc" | jq
 ```
 
 ---
@@ -304,16 +304,20 @@ npm run build && npm start
 
 ## Deployment
 
-The repo ships with a `Dockerfile` and a `fly.toml`. To deploy on
-[fly.io](https://fly.io):
+The production instance runs on a VPS behind https://tracking.shopinzo.bond,
+managed by `systemd` (`courier-tracking-api.service`, `ExecStart=node dist/server.js`).
+To ship an update:
 
 ```bash
-fly launch --no-deploy   # only the first time
-fly deploy
+git pull
+npm install
+npm run build
+sudo systemctl restart courier-tracking-api.service
 ```
 
-The Docker image includes Playwright Chromium for J&T captcha solving.
-The VM is configured with 1024 MB memory to accommodate headless Chromium.
+The repo also ships with a `Dockerfile` and a `fly.toml` for container-based
+deploys. The Docker image includes Playwright Chromium for J&T captcha solving,
+so allow ~1024 MB memory to accommodate headless Chromium.
 
 ---
 
