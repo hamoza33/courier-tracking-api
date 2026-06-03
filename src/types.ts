@@ -24,8 +24,14 @@ export interface TrackResult {
   waybillNo: string;
   /** Whether the carrier was able to find the shipment. */
   found: boolean;
-  /** Latest known status text (== events[0].status when present). */
+  /**
+   * Headline status — one of the four canonical values
+   * (Delivered | In Transit | Out for Delivery | Returned) when the shipment
+   * has events, falling back to the raw event label otherwise.
+   */
   latestStatus: string | null;
+  /** Raw latest event label as reported by the carrier (== events[0].status). */
+  latestStatusDetail: string | null;
   /** Latest known status time (ISO). */
   latestTime: string | null;
   /** Canonical status: Delivered | In Transit | Out for Delivery | Returned. */

@@ -21,8 +21,8 @@ export function formatTrackResultAsText(r: TrackResult, opts: FormatOptions = {}
   lines.push(`Waybill:       ${r.waybillNo}`);
   if (r.found) {
     lines.push(`Latest status: ${r.latestStatus ?? "(unknown)"}`);
-    if (r.normalizedStatus) {
-      lines.push(`Normalized:    ${r.normalizedStatus}`);
+    if (r.latestStatusDetail && r.latestStatusDetail !== r.latestStatus) {
+      lines.push(`Latest event:  ${r.latestStatusDetail}`);
     }
     lines.push(`Latest time:   ${r.latestTime ?? "(unknown)"}`);
   } else {
@@ -110,6 +110,7 @@ export function normalizeForJson(r: TrackResult, opts: FormatOptions = {}): {
   waybillNo: string;
   found: boolean;
   latestStatus: string | null;
+  latestStatusDetail: string | null;
   latestTime: string | null;
   normalizedStatus: TrackResult["normalizedStatus"];
   events: Array<{
@@ -142,6 +143,7 @@ export function normalizeForJson(r: TrackResult, opts: FormatOptions = {}): {
     waybillNo: r.waybillNo,
     found: r.found,
     latestStatus: r.latestStatus,
+    latestStatusDetail: r.latestStatusDetail,
     latestTime: r.latestTime,
     normalizedStatus: r.normalizedStatus,
     events,
