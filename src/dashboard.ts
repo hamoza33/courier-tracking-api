@@ -373,7 +373,7 @@ async function startTracking() {
         carrier: r.carrier || 'unknown',
         carrierName: r.result?.carrierName || r.carrier || 'Unknown',
         status: r.result?.normalizedStatus || (r.error ? 'Error' : 'Unknown'),
-        latestStatus: r.result?.latestStatus || (r.error?.message) || '\\u2014',
+        latestStatus: r.result?.latestStatusDetail || r.result?.latestStatus || (r.error?.message) || '\\u2014',
         lastUpdate: r.result?.latestTime || null,
         found: r.result?.found || false,
         events: r.result?.events || [],
