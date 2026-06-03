@@ -79,7 +79,7 @@ export async function trackJdw(waybillNo: string, lang = "en"): Promise<TrackRes
   }));
 
   const latestEvent = events[0];
-  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description) : null;
+  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description, "jdw") : null;
 
   return {
     carrier: "jdw",
@@ -100,6 +100,7 @@ function deriveJdwStatus(desc: string): string | null {
   const d = desc.toLowerCase();
   if (d.includes("delivered") || d.includes("signed")) return "Delivered";
   if (d.includes("on the way") || d.includes("courier")) return "Out for Delivery";
+  if (d.includes("ready to return to sender")) return "Returned to Sender";
   if (d.includes("returned to the station") || d.includes("rescheduled")) return "Return to Station";
   if (d.includes("arrived")) return "Arrived";
   if (d.includes("picked up") || d.includes("pickup")) return "Picked Up";

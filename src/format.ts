@@ -111,6 +111,7 @@ export function normalizeForJson(r: TrackResult, opts: FormatOptions = {}): {
   found: boolean;
   latestStatus: string | null;
   latestTime: string | null;
+  normalizedStatus: TrackResult["normalizedStatus"];
   events: Array<{
     step: number;
     time: string | null;
@@ -142,6 +143,7 @@ export function normalizeForJson(r: TrackResult, opts: FormatOptions = {}): {
     found: r.found,
     latestStatus: r.latestStatus,
     latestTime: r.latestTime,
+    normalizedStatus: r.normalizedStatus,
     events,
     extra: r.extra,
   };

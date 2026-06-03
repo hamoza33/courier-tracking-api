@@ -390,7 +390,7 @@ export async function trackJt(
 
       const latestEvent = events[0];
       const ns = latestEvent
-        ? normalizeStatus(latestEvent.status, latestEvent.description)
+        ? normalizeStatus(latestEvent.status, latestEvent.description, "jt")
         : null;
 
       return {
