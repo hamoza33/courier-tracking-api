@@ -1,6 +1,6 @@
 import * as cheerio from "cheerio";
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
-import { normalizeStatus } from "../normalize.js";
+import { normalizeStatus, extractUndeliveryReason } from "../normalize.js";
 
 /**
  * Injaz Express simply renders an HTML page in response to a form POST.
@@ -65,6 +65,7 @@ export async function trackInjaz(waybillNo: string): Promise<TrackResult> {
     latestStatusDetail: latestEvent?.status ?? null,
     latestTime: latestEvent?.time ?? null,
     normalizedStatus: ns,
+    undeliveryReason: extractUndeliveryReason(events, ns),
     events,
   };
 }

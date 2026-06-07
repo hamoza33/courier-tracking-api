@@ -112,6 +112,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   .extra-info{font-size:.6875rem;color:var(--muted);margin-top:2px}
   .extra-tag{display:inline-block;padding:1px 5px;border-radius:3px;background:#f0f0f0;color:#555;font-size:.6875rem;margin-right:3px;margin-top:2px}
   .warning-tag{display:inline-block;padding:1px 5px;border-radius:3px;background:#fef3c7;color:#92400e;font-size:.6875rem;margin-right:3px;margin-top:2px}
+  .undelivery-reason{display:inline-block;margin-top:3px;padding:2px 7px;border-radius:4px;background:#fff7ed;color:#9a3412;font-size:.6875rem;border:1px solid #fed7aa;max-width:260px;word-break:break-word}
 
   @media(max-width:768px){
     .controls{flex-direction:column}
@@ -374,6 +375,7 @@ async function startTracking() {
         carrierName: r.result?.carrierName || r.carrier || 'Unknown',
         status: r.result?.normalizedStatus || (r.error ? 'Error' : 'Unknown'),
         latestStatus: r.result?.latestStatusDetail || r.result?.latestStatus || (r.error?.message) || '\\u2014',
+        undeliveryReason: r.result?.undeliveryReason || null,
         lastUpdate: r.result?.latestTime || null,
         found: r.result?.found || false,
         events: r.result?.events || [],
@@ -467,7 +469,7 @@ function applyFilters() {
     }
     if (carrierF && r.carrier !== carrierF) return false;
     if (search) {
-      const hay = (r.waybill + ' ' + r.carrier + ' ' + r.carrierName + ' ' + r.status + ' ' + r.latestStatus + ' ' + (r.origin || '') + ' ' + (r.destination || '') + ' ' + (r.country || '')).toLowerCase();
+      const hay = (r.waybill + ' ' + r.carrier + ' ' + r.carrierName + ' ' + r.status + ' ' + r.latestStatus + ' ' + (r.undeliveryReason || '') + ' ' + (r.origin || '') + ' ' + (r.destination || '') + ' ' + (r.country || '')).toLowerCase();
       if (!hay.includes(search)) return false;
     }
     return true;
@@ -587,7 +589,7 @@ function renderTable(rows) {
       '<td>' + r.index + '</td>' +
       '<td><strong>' + escHtml(r.waybill) + '</strong></td>' +
       '<td><span class="carrier-tag">' + escHtml(r.carrierName) + '</span></td>' +
-      '<td>' + statusBadge(r.status) + '<br/><span style="font-size:.7rem;color:var(--muted)">' + escHtml(r.latestStatus) + '</span></td>' +
+      '<td>' + statusBadge(r.status) + '<br/><span style="font-size:.7rem;color:var(--muted)">' + escHtml(r.latestStatus) + '</span>' + (r.undeliveryReason ? '<br/><span class="undelivery-reason" title="' + escHtml(r.undeliveryReason) + '">\\u26A0 ' + escHtml(r.undeliveryReason) + '</span>' : '') + '</td>' +
       '<td>' + formatTime(r.lastUpdate) + '</td>' +
       '<td>' + originDest + '</td>' +
       '<td>' + detailHtml + '</td>' +

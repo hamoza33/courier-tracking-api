@@ -1,4 +1,4 @@
-import type { Carrier, NormalizedStatus } from "./types.js";
+import type { Carrier, NormalizedStatus, TrackEvent } from "./types.js";
 
 /**
  * Maps the latest tracking event text to one of four canonical statuses.
@@ -124,4 +124,71 @@ function isReturned(t: string, carrier?: Carrier): boolean {
         t.includes("rto")
       );
   }
+}
+
+// ─── Undelivery-reason extraction ───────────────────────────────────────────
+
+const UNDELIVERY_PATTERNS: RegExp[] = [
+  /not delivered/i,
+  /undelivered/i,
+  /un-delivered/i,
+  /delivery failed/i,
+  /failed delivery/i,
+  /delivery attempt/i,
+  /attempted/i,
+  /unable to deliver/i,
+  /could not be delivered/i,
+  /couldn't be delivered/i,
+  /cannot be delivered/i,
+  /customer.*(?:not available|unavailable|absent|not at home|not reachable|unreachable|didn't respond|did not respond|no response|refused|rejected|cancel)/i,
+  /wrong address/i,
+  /incorrect address/i,
+  /incomplete address/i,
+  /address.*(?:issue|problem|incorrect|wrong|incomplete)/i,
+  /refused/i,
+  /rejected/i,
+  /cancel/i,
+  /no money/i,
+  /insufficient fund/i,
+  /lack of fund/i,
+  /not paid/i,
+  /no.*(?:answer|response|reply)/i,
+  /closed/i,
+  /return.*(?:handling|process|sender|origin|logistics)/i,
+  /rescheduled/i,
+  /out of.*(?:area|zone|coverage)/i,
+  /damaged/i,
+  /lost/i,
+  /shipment on hold/i,
+  /on hold/i,
+  /held at/i,
+  /待取件|拒收|拒签|取消/,
+];
+
+/**
+ * Scan tracking events (assumed newest-first) and return the most recent
+ * description that explains why a shipment was not delivered.
+ *
+ * Returns `null` when:
+ *  - the shipment is delivered
+ *  - no event matches any known undelivery keyword
+ */
+export function extractUndeliveryReason(
+  events: TrackEvent[],
+  normalizedStatus: NormalizedStatus | null,
+): string | null {
+  // Nothing to extract for delivered shipments or missing status.
+  if (!normalizedStatus || normalizedStatus === "Delivered") return null;
+
+  for (const ev of events) {
+    const text = `${ev.status ?? ""} ${ev.description ?? ""}`.trim();
+    if (!text) continue;
+    for (const re of UNDELIVERY_PATTERNS) {
+      if (re.test(text)) {
+        // Prefer the description over the bare status label when available.
+        return (ev.description && ev.description.trim()) || (ev.status ?? text);
+      }
+    }
+  }
+  return null;
 }

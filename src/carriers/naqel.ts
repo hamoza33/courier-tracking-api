@@ -1,6 +1,6 @@
 import * as cheerio from "cheerio";
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
-import { normalizeStatus } from "../normalize.js";
+import { normalizeStatus, extractUndeliveryReason } from "../normalize.js";
 
 /**
  * Naqel Express tracking via the public website (HTML scraping).
@@ -80,6 +80,7 @@ export async function trackNaqel(waybillNo: string): Promise<TrackResult> {
     latestStatusDetail: latestEvent?.status ?? null,
     latestTime: latestEvent?.time ?? null,
     normalizedStatus: ns,
+    undeliveryReason: extractUndeliveryReason(events, ns),
     events,
   };
 }
