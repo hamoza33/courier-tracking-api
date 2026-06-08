@@ -221,6 +221,8 @@ function extractCarrierSpecificReason(
       return extractNaqelReason(events);
     case "imile":
       return extractImileReason(events);
+    case "injaz":
+      return extractInjazReason(events);
     default:
       return null;
   }
@@ -261,61 +263,65 @@ function extractNaqelReason(events: TrackEvent[]): string | null {
 }
 
 /**
- * iMile: after an "out for delivery" event, the subsequent events describe
- * why the delivery failed (e.g. "Uncontactable", "Cancel without reason",
- * "Invalid Number", "NoAnswer", "Customer Wants to Change Location").
+ * iMile: events are newest-first. The failure reason is the event that
+ * immediately follows an "out for delivery" event in chronological order.
+ * In newest-first order, that means we look for an "out for delivery" event
+ * and then the event BEFORE it in the array is the reason.
  *
- * We look for Delivery-stage events whose description is NOT the
- * out-for-delivery scan itself but a failure note.
+ * Examples (newest first):
+ *   "Cancel without reason"   ← this is the reason
+ *   "Our delivery associate is out for delivery..."
+ *   "Shipment is scheduled..."
+ *
+ * We skip generic boilerplate messages ("We failed to deliver", "Delivery
+ * attempt finished", return-handling events) and only pick concise failure
+ * descriptions like "Invalid Number", "Uncontactable", "NoAnswer", "Cancel".
  */
 function extractImileReason(events: TrackEvent[]): string | null {
-  const failurePatterns = [
-    /uncontactable/i,
-    /cancel/i,
-    /invalid.?number/i,
-    /no\s*answer/i,
-    /change.*location/i,
-    /change.*address/i,
-    /refused/i,
-    /rejected/i,
-    /not at home/i,
-    /unable to deliver/i,
-    /wrong address/i,
-    /incomplete address/i,
-    /customer.*not available/i,
-    /delivery attempt finished/i,
-    /failed to schedule/i,
-    /failed to deliver/i,
-  ];
+  // Scan events array (newest-first). When we find an "out for delivery"
+  // event, the event at index i-1 (which is newer / came after) is the reason.
+  for (let i = 0; i < events.length; i++) {
+    const desc = (events[i].description ?? "").trim();
+    if (!/out for delivery/i.test(desc)) continue;
 
+    // Walk backwards (toward newer events) to find the failure reason.
+    for (let j = i - 1; j >= 0; j--) {
+      const candidate = (events[j].description ?? "").trim();
+      if (!candidate) continue;
+      // Skip boilerplate / non-reason events
+      if (/out for delivery/i.test(candidate)) continue;
+      if (/shipment is scheduled/i.test(candidate)) continue;
+      if (/we failed to deliver/i.test(candidate)) continue;
+      if (/delivery attempt finished/i.test(candidate)) continue;
+      if (/shipment return/i.test(candidate)) continue;
+      if (/shipment received/i.test(candidate)) continue;
+      if (/return handling/i.test(candidate)) continue;
+      if (/returned to (?:client|origin)/i.test(candidate)) continue;
+      if (/has assigned delivery/i.test(candidate)) continue;
+      // "Failed to schedule due to [Reason]" — extract bracket content
+      const bracketMatch = candidate.match(/failed to schedule.*\[([^\]]+)\]/);
+      if (bracketMatch) return bracketMatch[1].trim();
+      // This is the concise failure reason ("Invalid Number", "Uncontactable", etc.)
+      return candidate;
+    }
+    // Found an "out for delivery" but no valid reason before it — stop
+    break;
+  }
+  return null;
+}
+
+/**
+ * Injaz: status text is formatted as "Not Delivered/Reason".
+ * Extract the part after "Not Delivered/" as the reason.
+ * Skip the generic "Returned to logistics" wrapper.
+ */
+function extractInjazReason(events: TrackEvent[]): string | null {
   for (const ev of events) {
-    const desc = (ev.description ?? "").trim();
-    if (!desc) continue;
-    // Skip generic out-for-delivery scans
-    if (/out for delivery/i.test(desc)) continue;
-    if (/has assigned delivery/i.test(desc)) continue;
-    if (/has arrived at/i.test(desc)) continue;
-    if (/has been shipped/i.test(desc)) continue;
-    if (/has been picked up/i.test(desc)) continue;
-    if (/order submitted/i.test(desc)) continue;
-    if (/shipment is scheduled/i.test(desc)) continue;
-    if (/scheduled delivery/i.test(desc)) continue;
-    if (/order has been received/i.test(desc)) continue;
-    if (/delivered successfully/i.test(desc)) continue;
-    if (/shipment received\./i.test(desc)) continue;
-    if (/shipment return to/i.test(desc)) continue;
-    if (/shipment returned to origin/i.test(desc)) continue;
-
-    for (const re of failurePatterns) {
-      if (re.test(desc)) {
-        // Clean up common prefixes
-        let reason = desc;
-        const bracketMatch = desc.match(/\[([^\]]+)\]/);
-        if (bracketMatch && /failed to schedule/i.test(desc)) {
-          reason = bracketMatch[1].trim();
-        }
-        return reason;
-      }
+    const text = ev.status ?? ev.description ?? "";
+    const m = text.match(/Not Delivered\/(\S.*)/i);
+    if (m) {
+      const reason = m[1].trim();
+      if (reason) return reason;
     }
   }
   return null;
