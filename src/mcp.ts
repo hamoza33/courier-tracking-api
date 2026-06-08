@@ -25,7 +25,7 @@ import { trackInjaz } from "./carriers/injaz.js";
 import { trackJt } from "./carriers/jt.js";
 import { trackJdw } from "./carriers/jdw.js";
 import { trackNaqel } from "./carriers/naqel.js";
-import { normalizeForJson } from "./format.js";
+import { normalizeForJson, summarizeForJson } from "./format.js";
 import { CarrierError, type Carrier, type TrackResult } from "./types.js";
 
 const CARRIER_VALUES = ["imile", "injaz", "jt", "jdw", "naqel", "auto"] as const;
@@ -111,7 +111,7 @@ export function buildMcpServer(): McpServer {
     },
     {
       instructions:
-        "Aggregator MCP server for five Middle-East courier services (iMile, Injaz Express, J&T Express, JDW Logistics, Naqel Express). Use `track_waybill` for a single shipment, `track_bulk` for up to 250 at once, `list_carriers` to discover supported carriers, and `detect_carrier` to preview auto-detection. Backed by https://tracking.shopinzo.bond.",
+        "Aggregator MCP server for five Middle-East courier services (iMile, Injaz Express, J&T Express, JDW Logistics, Naqel Express). Tools: `get_shipment_status` for quick status/reason lookup (no events), `get_shipment_summary` for batch status of up to 50 waybills, `track_waybill` for full event timeline of a single shipment, `track_bulk` for full timelines of up to 250 waybills, `list_carriers` to discover supported carriers, `detect_carrier` to preview auto-detection. All tracking responses include: normalizedStatus, latestStatus, latestStatusDetail, latestTime, undeliveryReason, carrier-specific extra data (origin/destination cities, country). Backed by https://tracking.shopinzo.bond.",
     },
   );
 
@@ -153,11 +153,99 @@ export function buildMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "get_shipment_status",
+    {
+      title: "Quick shipment status",
+      description:
+        "Quick status lookup — returns normalizedStatus, latestStatus, latestStatusDetail, latestTime, undeliveryReason, origin/destination cities, and carrier-specific extra data WITHOUT the full event timeline. Much faster for status checks.",
+      inputSchema: {
+        waybill: z.string().min(1).describe("Tracking / waybill number"),
+        carrier: z
+          .enum(CARRIER_VALUES)
+          .optional()
+          .describe("Carrier code, or 'auto' (default). Omit to auto-detect."),
+        lang: z
+          .string()
+          .optional()
+          .describe("Language hint for carriers that support it (e.g. 'en', 'ar', 'zh-CN')."),
+      },
+    },
+    async ({ waybill, carrier, lang }) => {
+      const trimmed = waybill.trim();
+      const carrierHint = carrier ?? "auto";
+
+      let resolved: Carrier | null = null;
+      if (carrierHint !== "auto") {
+        resolved = carrierHint as Carrier;
+      } else {
+        resolved = detectCarrier(trimmed);
+      }
+
+      if (resolved) {
+        const r = await runOne(resolved, trimmed, lang);
+        if (!r.ok) {
+          return asErrorContent(r.error.message, {
+            carrier: r.error.carrier,
+            captchaRequired: r.error.captchaRequired ?? false,
+          });
+        }
+        return asTextContent(summarizeForJson(r.result));
+      }
+
+      // Fan out to all carriers
+      const fanout = await Promise.all(
+        ALL_CARRIERS.map(async (c) => {
+          const r = await runOne(c, trimmed, lang);
+          if (r.ok && r.result.found) return summarizeForJson(r.result);
+          return null;
+        }),
+      );
+      const found = fanout.filter(Boolean);
+      if (found.length > 0) return asTextContent(found[0]);
+      return asErrorContent("No carrier found tracking data for this waybill");
+    },
+  );
+
+  server.registerTool(
+    "get_shipment_summary",
+    {
+      title: "Shipment summary with key events",
+      description:
+        "Returns all shipment metadata (normalizedStatus, latestStatus, latestStatusDetail, latestTime, undeliveryReason, originCity, destinationCity, extra carrier data) plus the first and last events for context. Use this when you need a quick overview without downloading the entire event timeline. For bulk status checks, use track_bulk instead.",
+      inputSchema: {
+        waybills: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(50)
+          .describe("Array of waybill numbers to summarize (up to 50)."),
+        lang: z.string().optional().describe("Language hint for carriers that support it."),
+      },
+    },
+    async ({ waybills, lang }) => {
+      const results = await Promise.all(
+        waybills.map(async (wb) => {
+          const trimmed = wb.trim();
+          const carrier = detectCarrier(trimmed);
+          if (!carrier) {
+            return { waybill: trimmed, error: "Could not detect carrier" };
+          }
+          const r = await runOne(carrier, trimmed, lang);
+          if (!r.ok) {
+            return { waybill: trimmed, carrier, error: r.error.message };
+          }
+          return summarizeForJson(r.result);
+        }),
+      );
+      return asTextContent(results);
+    },
+  );
+
+  server.registerTool(
     "track_waybill",
     {
-      title: "Track a single waybill",
+      title: "Track a single waybill (full events)",
       description:
-        "Track a single shipment by waybill number. Carrier is auto-detected from the waybill format unless explicitly provided. If detection fails and no carrier is given, all carriers are queried in parallel.",
+        "Track a single shipment by waybill number with the FULL event timeline. Returns: carrier, carrierName, waybillNo, found, normalizedStatus (Delivered/In Transit/Out for Delivery/Returned), latestStatus, latestStatusDetail, latestTime, undeliveryReason, events[] (each with step, time, status, description, location, timezone), and extra carrier-specific data (origin city, destination city, country, etc.). Carrier is auto-detected unless explicitly provided.",
       inputSchema: {
         waybill: z.string().min(1).describe("Tracking / waybill number"),
         carrier: z
@@ -217,9 +305,9 @@ export function buildMcpServer(): McpServer {
   server.registerTool(
     "track_bulk",
     {
-      title: "Track multiple waybills",
+      title: "Track multiple waybills (full events)",
       description:
-        "Track up to 250 waybills in a single call. Non-J&T waybills are processed in parallel; J&T waybills are processed sequentially because of CAPTCHA.",
+        "Track up to 250 waybills in a single call. Returns full event timelines for each. Each result includes: carrier, carrierName, waybillNo, found, normalizedStatus, latestStatus, latestStatusDetail, latestTime, undeliveryReason, events[], and extra carrier data. Non-J&T waybills are processed in parallel; J&T waybills are processed sequentially because of CAPTCHA.",
       inputSchema: {
         waybills: z
           .array(
