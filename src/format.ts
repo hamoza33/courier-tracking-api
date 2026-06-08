@@ -25,6 +25,9 @@ export function formatTrackResultAsText(r: TrackResult, opts: FormatOptions = {}
       lines.push(`Latest event:  ${r.latestStatusDetail}`);
     }
     lines.push(`Latest time:   ${r.latestTime ?? "(unknown)"}`);
+    if (r.undeliveryReason) {
+      lines.push(`Undelivery:    ${r.undeliveryReason}`);
+    }
   } else {
     lines.push("Status:        No tracking events found for this waybill.");
   }
@@ -113,6 +116,7 @@ export function normalizeForJson(r: TrackResult, opts: FormatOptions = {}): {
   latestStatusDetail: string | null;
   latestTime: string | null;
   normalizedStatus: TrackResult["normalizedStatus"];
+  undeliveryReason: string | null;
   events: Array<{
     step: number;
     time: string | null;
@@ -146,6 +150,7 @@ export function normalizeForJson(r: TrackResult, opts: FormatOptions = {}): {
     latestStatusDetail: r.latestStatusDetail,
     latestTime: r.latestTime,
     normalizedStatus: r.normalizedStatus,
+    undeliveryReason: r.undeliveryReason,
     events,
     extra: r.extra,
   };

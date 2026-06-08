@@ -1,7 +1,7 @@
 import { chromium, type Browser, type Page } from "playwright";
 import sharp from "sharp";
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
-import { normalizeStatus } from "../normalize.js";
+import { normalizeStatus, extractUndeliveryReason } from "../normalize.js";
 
 const JT_URL = "https://www.jtexpress.me/KSA/trajectoryQuery";
 
@@ -402,6 +402,7 @@ export async function trackJt(
         latestStatusDetail: latestEvent?.status ?? null,
         latestTime: latestEvent?.time ?? null,
         normalizedStatus: ns,
+        undeliveryReason: extractUndeliveryReason(events, ns, "jt"),
         events,
       };
     } catch (err) {

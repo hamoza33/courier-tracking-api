@@ -31,8 +31,9 @@ assert("Injaz delivery", normalizeStatus("Delivery", null, "injaz"), "Out for De
 assert("Injaz ofd", normalizeStatus("Out for delivery", null, "injaz"), "Out for Delivery");
 
 // --- Returned (carrier-specific FINAL return only) ---
-// iMile: only "Return Handling Process" counts as returned
+// iMile: "Return Handling Process" or "Returned to Client" counts as returned
 assert("iMile return handling process", normalizeStatus("Return Handling Process", null, "imile"), "Returned");
+assert("iMile returned to client", normalizeStatus("Returned to Client", "Shipment returned to origin.", "imile"), "Returned");
 assert("iMile other return text -> in transit", normalizeStatus("Returned to warehouse", null, "imile"), "In Transit");
 
 // JDW: "is ready to return to senders address" is returned; "Return to Station" is another attempt

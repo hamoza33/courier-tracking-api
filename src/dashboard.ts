@@ -378,6 +378,7 @@ async function startTracking() {
         found: r.result?.found || false,
         events: r.result?.events || [],
         error: r.error || null,
+        undeliveryReason: r.result?.undeliveryReason || null,
         extra: extra,
         warnings: warnings,
         origin: extra.sendSite || extra.originCity || extra.senderCity || null,
@@ -587,7 +588,7 @@ function renderTable(rows) {
       '<td>' + r.index + '</td>' +
       '<td><strong>' + escHtml(r.waybill) + '</strong></td>' +
       '<td><span class="carrier-tag">' + escHtml(r.carrierName) + '</span></td>' +
-      '<td>' + statusBadge(r.status) + '<br/><span style="font-size:.7rem;color:var(--muted)">' + escHtml(r.latestStatus) + '</span></td>' +
+      '<td>' + statusBadge(r.status) + '<br/><span style="font-size:.7rem;color:var(--muted)">' + escHtml(r.latestStatus) + '</span>' + (r.undeliveryReason ? '<br/><span style="font-size:.675rem;color:var(--red)">Reason: ' + escHtml(r.undeliveryReason) + '</span>' : '') + '</td>' +
       '<td>' + formatTime(r.lastUpdate) + '</td>' +
       '<td>' + originDest + '</td>' +
       '<td>' + detailHtml + '</td>' +
