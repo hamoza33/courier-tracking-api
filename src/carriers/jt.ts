@@ -1,5 +1,6 @@
 import { chromium, type Browser, type Page } from "playwright";
 import sharp from "sharp";
+import { cv } from "opencv-wasm";
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
 import { normalizeStatus, extractUndeliveryReason } from "../normalize.js";
 
@@ -111,85 +112,33 @@ async function templateMatch(
 ): Promise<number> {
   const bgMeta = await sharp(bgBuf).metadata();
   const pMeta = await sharp(pieceBuf).metadata();
-  const bgGray = await sharp(bgBuf).greyscale().raw().toBuffer();
-  const pGray = await sharp(pieceBuf).greyscale().raw().toBuffer();
-  const bgW = bgMeta.width!;
-  const bgH = bgMeta.height!;
-  const pW = pMeta.width!;
-  const pH = pMeta.height!;
+  const bgRaw = await sharp(bgBuf).ensureAlpha().raw().toBuffer();
+  const pRaw = await sharp(pieceBuf).ensureAlpha().raw().toBuffer();
 
-  function sobelEdges(gray: Buffer, w: number, h: number): Float64Array {
-    const edges = new Float64Array(w * h);
-    for (let y = 1; y < h - 1; y++) {
-      for (let x = 1; x < w - 1; x++) {
-        const gx =
-          -gray[(y - 1) * w + (x - 1)] +
-          gray[(y - 1) * w + (x + 1)] -
-          2 * gray[y * w + (x - 1)] +
-          2 * gray[y * w + (x + 1)] -
-          gray[(y + 1) * w + (x - 1)] +
-          gray[(y + 1) * w + (x + 1)];
-        const gy =
-          -gray[(y - 1) * w + (x - 1)] -
-          2 * gray[(y - 1) * w + x] -
-          gray[(y - 1) * w + (x + 1)] +
-          gray[(y + 1) * w + (x - 1)] +
-          2 * gray[(y + 1) * w + x] +
-          gray[(y + 1) * w + (x + 1)];
-        edges[y * w + x] = Math.sqrt(gx * gx + gy * gy);
-      }
-    }
-    return edges;
-  }
+  const bgMat = new cv.Mat(bgMeta.height!, bgMeta.width!, cv.CV_8UC4);
+  bgMat.data.set(bgRaw);
+  const pMat = new cv.Mat(pMeta.height!, pMeta.width!, cv.CV_8UC4);
+  pMat.data.set(pRaw);
 
-  const bgEdge = sobelEdges(bgGray, bgW, bgH);
-  const pEdge = sobelEdges(pGray, pW, pH);
+  const bgGray = new cv.Mat();
+  const pGray = new cv.Mat();
+  cv.cvtColor(bgMat, bgGray, cv.COLOR_RGBA2GRAY);
+  cv.cvtColor(pMat, pGray, cv.COLOR_RGBA2GRAY);
 
-  let pSum = 0,
-    pSq = 0,
-    pN = 0;
-  for (let i = 0; i < pW * pH; i++) {
-    if (pEdge[i] > 10) {
-      pSum += pEdge[i];
-      pSq += pEdge[i] ** 2;
-      pN++;
-    }
-  }
-  const pMean = pSum / Math.max(pN, 1);
-  const pStd = Math.sqrt(pSq / Math.max(pN, 1) - pMean ** 2);
+  const bgEdges = new cv.Mat();
+  const pEdges = new cv.Mat();
+  cv.Canny(bgGray, bgEdges, 100, 200);
+  cv.Canny(pGray, pEdges, 100, 200);
 
-  let bestX = 0,
-    bestCorr = -Infinity;
-  const searchStart = Math.floor(bgW * 0.2);
-  for (let sy = 0; sy < bgH - pH; sy += 2) {
-    for (let sx = searchStart; sx < bgW - pW; sx++) {
-      let sum = 0,
-        bSum = 0,
-        bSq = 0,
-        cnt = 0;
-      for (let ty = 0; ty < pH; ty += 2) {
-        for (let tx = 0; tx < pW; tx++) {
-          const tv = pEdge[ty * pW + tx];
-          if (tv < 10) continue;
-          const bv = bgEdge[(sy + ty) * bgW + (sx + tx)];
-          sum += tv * bv;
-          bSum += bv;
-          bSq += bv ** 2;
-          cnt++;
-        }
-      }
-      if (cnt < 10) continue;
-      const bMean = bSum / cnt;
-      const bStd = Math.sqrt(bSq / cnt - bMean ** 2);
-      const ncc =
-        (sum / cnt - pMean * bMean) /
-        (Math.max(pStd, 1) * Math.max(bStd, 1));
-      if (ncc > bestCorr) {
-        bestCorr = ncc;
-        bestX = sx;
-      }
-    }
-  }
+  const result = new cv.Mat();
+  cv.matchTemplate(bgEdges, pEdges, result, cv.TM_CCOEFF_NORMED);
+  const bestX = cv.minMaxLoc(result).maxLoc.x;
+
+  bgMat.delete(); pMat.delete();
+  bgGray.delete(); pGray.delete();
+  bgEdges.delete(); pEdges.delete();
+  result.delete();
+
   return bestX;
 }
 
