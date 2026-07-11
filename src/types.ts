@@ -36,6 +36,12 @@ export interface TrackResult {
   latestTime: string | null;
   /** Canonical status: Delivered | In Transit | Out for Delivery | Returned. */
   normalizedStatus: NormalizedStatus | null;
+  /**
+   * Most recent reason why the shipment was not delivered, extracted from
+   * tracking events. `null` when the shipment is delivered or no reason is
+   * found in the event history.
+   */
+  undeliveryReason: string | null;
   /** Track events ordered newest -> oldest (default) or oldest -> newest (?order=asc). */
   events: TrackEvent[];
   /** Optional extra fields returned by the source. */

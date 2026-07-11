@@ -25,6 +25,9 @@ export function formatTrackResultAsText(r: TrackResult, opts: FormatOptions = {}
       lines.push(`Latest event:  ${r.latestStatusDetail}`);
     }
     lines.push(`Latest time:   ${r.latestTime ?? "(unknown)"}`);
+    if (r.undeliveryReason) {
+      lines.push(`Undelivery:    ${r.undeliveryReason}`);
+    }
   } else {
     lines.push("Status:        No tracking events found for this waybill.");
   }
@@ -113,6 +116,7 @@ export function normalizeForJson(r: TrackResult, opts: FormatOptions = {}): {
   latestStatusDetail: string | null;
   latestTime: string | null;
   normalizedStatus: TrackResult["normalizedStatus"];
+  undeliveryReason: string | null;
   events: Array<{
     step: number;
     time: string | null;
@@ -146,8 +150,73 @@ export function normalizeForJson(r: TrackResult, opts: FormatOptions = {}): {
     latestStatusDetail: r.latestStatusDetail,
     latestTime: r.latestTime,
     normalizedStatus: r.normalizedStatus,
+    undeliveryReason: r.undeliveryReason,
     events,
     extra: r.extra,
+  };
+}
+
+/**
+ * Return a compact summary of a TrackResult — all metadata fields, the first
+ * and last events, origin/destination cities, and extra carrier data, but
+ * without the full event list.  Useful for quick status lookups.
+ */
+export function summarizeForJson(r: TrackResult): {
+  carrier: string;
+  carrierName: string;
+  waybillNo: string;
+  found: boolean;
+  normalizedStatus: TrackResult["normalizedStatus"];
+  latestStatus: string | null;
+  latestStatusDetail: string | null;
+  latestTime: string | null;
+  undeliveryReason: string | null;
+  totalEvents: number;
+  firstEvent: {
+    time: string | null;
+    status: string | null;
+    description: string;
+    location: string | null;
+  } | null;
+  lastEvent: {
+    time: string | null;
+    status: string | null;
+    description: string;
+    location: string | null;
+  } | null;
+  originCity: string | null;
+  destinationCity: string | null;
+  extra: Record<string, unknown>;
+  warnings: string[];
+} {
+  const eventsOldestFirst = [...r.events].reverse();
+  const first = eventsOldestFirst[0] ?? null;
+  const last = eventsOldestFirst.length > 1 ? eventsOldestFirst[eventsOldestFirst.length - 1] : null;
+
+  const originCity = first?.location ?? (r.extra?.sendSite as string | null) ?? null;
+  const destinationCity = last?.location ?? (r.extra?.dispatchStation as string | null) ?? null;
+
+  return {
+    carrier: r.carrier,
+    carrierName: r.carrierName,
+    waybillNo: r.waybillNo,
+    found: r.found,
+    normalizedStatus: r.normalizedStatus,
+    latestStatus: r.latestStatus,
+    latestStatusDetail: r.latestStatusDetail,
+    latestTime: r.latestTime,
+    undeliveryReason: r.undeliveryReason,
+    totalEvents: r.events.length,
+    firstEvent: first
+      ? { time: first.time, status: first.status, description: first.description, location: first.location ?? null }
+      : null,
+    lastEvent: last
+      ? { time: last.time, status: last.status, description: last.description, location: last.location ?? null }
+      : null,
+    originCity,
+    destinationCity,
+    extra: r.extra ?? {},
+    warnings: r.warnings ?? [],
   };
 }
 
