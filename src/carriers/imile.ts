@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import forge from "node-forge";
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
+import { normalizeStatus, extractUndeliveryReason } from "../normalize.js";
 
 const RSA_PUB_KEY_B64 =
   "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3dFPiKNZwt+HoBbPAG/t7kZC2k3pBX2eCl5LeyeW8woNuEV5bA5kB9Y9KKTOQng62ERGPLwi84CdIB8s265ljQUib//iO3jVrZesJueO5Xu+s80s3Z/89jgJleT1XawN1GubgkGXOoT1a7tvX8+aItkGgR//48ELqJVVUL+yGsBtXxFjNmOEWxBJNQuwAf9yWcCIl1enD60GjZjPWrsfw8QUqam7K5e45ealcPEYGenNePwuPpCq6twdD0YYYzKdRN0dZP1uTviFpNfph90c9YgQ8kgDkRMcpjVv6KZ+bg5JZ4sK6LkV4vwOjPijisthHBvUXhu3fyhMgvoDO/j5gwIDAQAB";
@@ -74,7 +75,10 @@ export async function trackImile(waybillNo: string, lang = "en-US"): Promise<Tra
       waybillNo: wb,
       found: false,
       latestStatus: null,
+      latestStatusDetail: null,
       latestTime: null,
+      normalizedStatus: null,
+      undeliveryReason: null,
       events: [],
       extra: { rawStatus: body.status, resultCode: body.resultCode, resultMsg: body.resultMsg },
     };
@@ -88,13 +92,19 @@ export async function trackImile(waybillNo: string, lang = "en-US"): Promise<Tra
     location: t.operateStationName ?? null,
   }));
 
+  const latestEvent = events[0];
+  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description, "imile") : null;
+
   return {
     carrier: "imile",
     carrierName: "iMile",
     waybillNo: r.waybillNo ?? wb,
     found: events.length > 0,
-    latestStatus: events[0]?.status ?? null,
-    latestTime: events[0]?.time ?? null,
+    latestStatus: ns ?? latestEvent?.status ?? null,
+    latestStatusDetail: latestEvent?.status ?? null,
+    latestTime: latestEvent?.time ?? null,
+    normalizedStatus: ns,
+    undeliveryReason: extractUndeliveryReason(events, ns),
     events,
     extra: {
       sendSite: r.sendSite ?? null,

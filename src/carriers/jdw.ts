@@ -1,4 +1,5 @@
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
+import { normalizeStatus, extractUndeliveryReason } from "../normalize.js";
 
 interface JdwTrackNode {
   hasPodUrl?: number;
@@ -77,13 +78,19 @@ export async function trackJdw(waybillNo: string, lang = "en"): Promise<TrackRes
     location: null,
   }));
 
+  const latestEvent = events[0];
+  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description, "jdw") : null;
+
   return {
     carrier: "jdw",
     carrierName: "JDW Logistics",
     waybillNo: wb,
     found: events.length > 0,
-    latestStatus: events[0]?.status ?? null,
-    latestTime: events[0]?.time ?? null,
+    latestStatus: ns ?? latestEvent?.status ?? null,
+    latestStatusDetail: latestEvent?.status ?? null,
+    latestTime: latestEvent?.time ?? null,
+    normalizedStatus: ns,
+    undeliveryReason: extractUndeliveryReason(events, ns),
     events,
     extra: {
       waybillNum: first?.waybillNum ?? null,
@@ -95,6 +102,7 @@ function deriveJdwStatus(desc: string): string | null {
   const d = desc.toLowerCase();
   if (d.includes("delivered") || d.includes("signed")) return "Delivered";
   if (d.includes("on the way") || d.includes("courier")) return "Out for Delivery";
+  if (d.includes("ready to return to sender")) return "Returned to Sender";
   if (d.includes("returned to the station") || d.includes("rescheduled")) return "Return to Station";
   if (d.includes("arrived")) return "Arrived";
   if (d.includes("picked up") || d.includes("pickup")) return "Picked Up";

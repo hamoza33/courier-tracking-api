@@ -1,4 +1,6 @@
-export type Carrier = "imile" | "injaz" | "jt" | "jdw";
+export type Carrier = "imile" | "injaz" | "jt" | "jdw" | "naqel";
+
+export type NormalizedStatus = "Delivered" | "In Transit" | "Out for Delivery" | "Returned";
 
 export interface TrackEvent {
   /** ISO 8601 timestamp when the event occurred, or null if the source did not provide one. */
@@ -22,11 +24,25 @@ export interface TrackResult {
   waybillNo: string;
   /** Whether the carrier was able to find the shipment. */
   found: boolean;
-  /** Latest known status text (== events[0].status when present). */
+  /**
+   * Headline status — one of the four canonical values
+   * (Delivered | In Transit | Out for Delivery | Returned) when the shipment
+   * has events, falling back to the raw event label otherwise.
+   */
   latestStatus: string | null;
+  /** Raw latest event label as reported by the carrier (== events[0].status). */
+  latestStatusDetail: string | null;
   /** Latest known status time (ISO). */
   latestTime: string | null;
-  /** Track events ordered newest -> oldest. */
+  /** Canonical status: Delivered | In Transit | Out for Delivery | Returned. */
+  normalizedStatus: NormalizedStatus | null;
+  /**
+   * Most recent reason why the shipment was not delivered, extracted from
+   * tracking events. `null` when the shipment is delivered or no reason is
+   * found in the event history.
+   */
+  undeliveryReason: string | null;
+  /** Track events ordered newest -> oldest (default) or oldest -> newest (?order=asc). */
   events: TrackEvent[];
   /** Optional extra fields returned by the source. */
   extra?: Record<string, unknown>;
