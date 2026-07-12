@@ -197,8 +197,17 @@ let sortKey = 'index';
 let sortDir = 'asc';
 let apiOnline = null;
 const STORAGE_KEY = 'courier_dashboard_waybills';
-const MAX_RETRIES = 2;
-const REQUEST_TIMEOUT_MS = 120000;
+// Tracking is non-idempotent from the CAPTCHA provider's perspective: retrying a
+// timed-out bulk request duplicates every solve while the original keeps running.
+// Large J&T batches can legitimately take 10–20 minutes with a five-worker pool.
+const MAX_RETRIES = 0;
+const MIN_REQUEST_TIMEOUT_MS = 180000;
+const MAX_REQUEST_TIMEOUT_MS = 1800000;
+
+function bulkRequestTimeoutMs(count) {
+  // Budget roughly 35 seconds per wave of five J&T items, plus startup margin.
+  return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(MIN_REQUEST_TIMEOUT_MS, Math.ceil(count / 5) * 35000 + 60000));
+}
 
 function parseWaybills(text) {
   return text
@@ -271,12 +280,12 @@ async function checkApiHealth() {
   return apiOnline;
 }
 
-async function fetchWithRetry(url, options, retries) {
+async function fetchWithRetry(url, options, retries, timeoutMs = MIN_REQUEST_TIMEOUT_MS) {
   let lastErr = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
       const resp = await fetch(url, { ...options, signal: ctrl.signal });
       clearTimeout(timer);
       if (!resp.ok && resp.status >= 500 && attempt < retries) {
@@ -288,7 +297,7 @@ async function fetchWithRetry(url, options, retries) {
     } catch (err) {
       lastErr = err;
       if (err.name === 'AbortError') {
-        lastErr = new Error('Request timed out after ' + (REQUEST_TIMEOUT_MS / 1000) + 's');
+        lastErr = new Error('Request timed out after ' + Math.round(timeoutMs / 1000) + 's');
       }
       if (attempt < retries) {
         await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
@@ -352,7 +361,7 @@ async function startTracking() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ waybills, order: 'desc' }),
-    }, MAX_RETRIES);
+    }, MAX_RETRIES, bulkRequestTimeoutMs(waybills.length));
 
     const data = await resp.json();
     clearInterval(timer);
