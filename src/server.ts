@@ -18,7 +18,7 @@ import { buildMcpServer } from "./mcp.js";
 import { CourierMcpOAuthProvider } from "./oauth.js";
 import { trackImile } from "./carriers/imile.js";
 import { trackInjaz } from "./carriers/injaz.js";
-import { trackJt } from "./carriers/jt.js";
+import { trackJt, trackJtBatch } from "./carriers/jt.js";
 import { trackJdw } from "./carriers/jdw.js";
 import { trackNaqel } from "./carriers/naqel.js";
 import { CarrierError, type Carrier, type TrackResult } from "./types.js";
@@ -28,7 +28,7 @@ import {
   normalizeForJson,
   type FormatOptions,
 } from "./format.js";
-import { getJtBulkConcurrency, mapConcurrent, resolveBulkCarrier } from "./bulk.js";
+import { chunkItems, getJtBulkConcurrency, mapConcurrent, resolveBulkCarrier } from "./bulk.js";
 import { DASHBOARD_HTML } from "./dashboard.js";
 
 type MultiTrackResult = { carrier: string; result?: TrackResult; error?: { message: string; captchaRequired?: boolean } };
@@ -640,7 +640,7 @@ async function start() {
     {
       schema: {
         tags: ["tracking"],
-        summary: `Track up to 250 waybills at once. J&T uses controlled concurrency (${getJtBulkConcurrency()} workers).`,
+        summary: `Track up to 250 waybills at once. J&T is grouped into batches of up to 10 per CAPTCHA with ${getJtBulkConcurrency()} concurrent groups.`,
         body: {
           type: "object",
           required: ["waybills"],
@@ -694,13 +694,19 @@ async function start() {
         orderedResults[entry.index] = await trackOneBulk(entry.item);
       }));
       const jtEntries = indexed.filter((entry) => entry.carrier === "jt");
-      const jtPromise = mapConcurrent(jtEntries, jtConcurrency, async (entry) => trackOneBulk(entry.item));
+      const jtGroups = chunkItems(jtEntries, 10);
+      const jtPromise = mapConcurrent(jtGroups, jtConcurrency, async (group) => {
+        const batch = await trackJtBatch(group.map((entry) => entry.item.waybill), { lang: group[0]?.item.lang });
+        return group.map((entry, index) => ({ entry, result: batch[index] }));
+      });
       const [, jtOutcomes] = await Promise.all([nonJtPromise, jtPromise]);
-      jtOutcomes.forEach((outcome, index) => {
-        const entry = jtEntries[index];
-        orderedResults[entry.index] = outcome instanceof Error
-          ? { waybill: entry.item.waybill.trim(), carrier: "jt", error: { message: outcome.message } }
-          : outcome;
+      jtOutcomes.forEach((outcome, groupIndex) => {
+        const group = jtGroups[groupIndex];
+        if (outcome instanceof Error) {
+          group.forEach((entry) => { orderedResults[entry.index] = { waybill: entry.item.waybill.trim(), carrier: "jt", error: { message: outcome.message } }; });
+        } else {
+          outcome.forEach(({ entry, result }) => { orderedResults[entry.index] = { waybill: entry.item.waybill.trim(), carrier: "jt", result }; });
+        }
       });
 
       for (const item of orderedResults) {
@@ -768,13 +774,16 @@ async function start() {
           results[entry.index] = await trackOneBulk(entry.item);
         }));
         const jtEntries = indexed.filter((entry) => entry.carrier === "jt");
-        const jtPromise = mapConcurrent(jtEntries, getJtBulkConcurrency(), async (entry) => trackOneBulk(entry.item));
+        const jtGroups = chunkItems(jtEntries, 10);
+        const jtPromise = mapConcurrent(jtGroups, getJtBulkConcurrency(), async (group) => {
+          const batchResults = await trackJtBatch(group.map((entry) => entry.item.waybill), { lang: group[0]?.item.lang });
+          return group.map((entry, index) => ({ entry, result: batchResults[index] }));
+        });
         const [, outcomes] = await Promise.all([nonJtPromise, jtPromise]);
-        outcomes.forEach((outcome, index) => {
-          const entry = jtEntries[index];
-          results[entry.index] = outcome instanceof Error
-            ? { waybill: entry.item.waybill.trim(), carrier: "jt", error: { message: outcome.message } }
-            : outcome;
+        outcomes.forEach((outcome, groupIndex) => {
+          const group = jtGroups[groupIndex];
+          if (outcome instanceof Error) group.forEach((entry) => { results[entry.index] = { waybill: entry.item.waybill.trim(), carrier: "jt", error: { message: outcome.message } }; });
+          else outcome.forEach(({ entry, result }) => { results[entry.index] = { waybill: entry.item.waybill.trim(), carrier: "jt", result }; });
         });
         return { results, durationMs: Math.round(performance.now() - start) };
       }

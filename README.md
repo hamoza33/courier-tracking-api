@@ -234,7 +234,7 @@ This project first uses **2Captcha TencentTaskProxyless** when
 If no key is configured, or the external solve fails, the existing local
 Playwright image solver remains available as fallback. It captures the slider
 images, applies Sobel/template matching, performs a humanlike drag, and
-intercepts the v2 tracking response. No credentials are stored in the code.
+intercepts the v2 tracking response. Bulk REST, benchmark, and MCP paths group J&T inputs into chunks of up to 10, so each group shares one Playwright page, CAPTCHA solve, and API response while preserving input order, duplicates, and per-waybill missing results. `JT_BULK_CONCURRENCY` controls concurrent groups, not individual waybills. No credentials are stored in the code.
 
 J&T now uses a v2 API endpoint:
 `POST https://ofmg.jtjms-sa.com/official/logisticsTracking/v2/getDetailByWaybillNo`
@@ -302,7 +302,7 @@ npm run build && npm start
 | `RATE_LIMIT_MAX`             | `60`                          | Requests per window per IP                    |
 | `RATE_LIMIT_WINDOW`          | `1 minute`                    | Rate-limit window                             |
 | `TWOCAPTCHA_API_KEY`         | unset                         | Optional 2Captcha key for J&T TencentTaskProxyless; local solver is fallback |
-| `JT_BULK_CONCURRENCY`        | `5`                           | Concurrent J&T workers for REST, benchmark, and MCP bulk/summary paths; clamped to 1..10 |
+| `JT_BULK_CONCURRENCY`        | `5`                           | Concurrent J&T groups (up to 10 waybills/CAPTCHA) for REST, benchmark, and MCP bulk/summary paths; clamped to 1..10. Consider 2–5 on memory-constrained hosts |
 | `MCP_AUTH_TOKEN`             | unset                         | MCP OAuth/admin bearer token                  |
 | `MCP_PUBLIC_URL`             | production URL                | Public base URL used by MCP OAuth metadata    |
 

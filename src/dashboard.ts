@@ -199,14 +199,14 @@ let apiOnline = null;
 const STORAGE_KEY = 'courier_dashboard_waybills';
 // Tracking is non-idempotent from the CAPTCHA provider's perspective: retrying a
 // timed-out bulk request duplicates every solve while the original keeps running.
-// Large J&T batches can legitimately take 10–20 minutes with a five-worker pool.
+// Large J&T batches are processed as groups of up to ten waybills per CAPTCHA.
 const MAX_RETRIES = 0;
 const MIN_REQUEST_TIMEOUT_MS = 180000;
 const MAX_REQUEST_TIMEOUT_MS = 1800000;
 
 function bulkRequestTimeoutMs(count) {
-  // Budget roughly 35 seconds per wave of five J&T items, plus startup margin.
-  return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(MIN_REQUEST_TIMEOUT_MS, Math.ceil(count / 5) * 35000 + 60000));
+  // Budget roughly 35 seconds per wave of ten-waybill groups at five concurrent groups.
+  return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(MIN_REQUEST_TIMEOUT_MS, Math.ceil(Math.ceil(count / 10) / 5) * 35000 + 60000));
 }
 
 function parseWaybills(text) {

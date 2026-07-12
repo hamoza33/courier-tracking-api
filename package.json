@@ -10,7 +10,7 @@
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "lint": "tsc --noEmit",
-    "test": "tsx src/normalize.test.ts && tsx src/bulk.test.ts"
+    "test": "tsx src/normalize.test.ts && tsx src/bulk.test.ts && tsx src/jt-batch.test.ts"
   },
   "engines": {
     "node": ">=20.0.0"

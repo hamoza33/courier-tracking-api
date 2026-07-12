@@ -19,11 +19,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import { getJtBulkConcurrency, mapConcurrent } from "./bulk.js";
+import { chunkItems, getJtBulkConcurrency, mapConcurrent } from "./bulk.js";
 import { ALL_CARRIERS, CARRIER_NAMES, detectCarrier } from "./detect.js";
 import { trackImile } from "./carriers/imile.js";
 import { trackInjaz } from "./carriers/injaz.js";
-import { trackJt } from "./carriers/jt.js";
+import { trackJt, trackJtBatch } from "./carriers/jt.js";
 import { trackJdw } from "./carriers/jdw.js";
 import { trackNaqel } from "./carriers/naqel.js";
 import { normalizeForJson, summarizeForJson } from "./format.js";
@@ -212,7 +212,7 @@ export function buildMcpServer(): McpServer {
     {
       title: "Shipment summary with key events",
       description:
-        `Returns all shipment metadata plus first/last events for up to 50 waybills. Non-J&T work runs in parallel; J&T uses controlled concurrency (${getJtBulkConcurrency()} workers, configured by JT_BULK_CONCURRENCY).`,
+        `Returns all shipment metadata plus first/last events for up to 50 waybills. Non-J&T work runs in parallel; J&T uses batches of up to 10 waybills per CAPTCHA (${getJtBulkConcurrency()} concurrent groups, configured by JT_BULK_CONCURRENCY).`,
       inputSchema: {
         waybills: z
           .array(z.string().min(1))
@@ -231,14 +231,16 @@ export function buildMcpServer(): McpServer {
         results[index] = r.ok ? summarizeForJson(r.result) : { waybill: trimmed, carrier, error: r.error.message };
       }));
       const jtWork = work.filter((item) => item.carrier === "jt");
-      const jtPromise = mapConcurrent(jtWork, getJtBulkConcurrency(), async ({ waybill: trimmed, carrier }) => {
-        const r = await runOne(carrier!, trimmed, lang);
-        return r.ok ? summarizeForJson(r.result) : { waybill: trimmed, carrier, error: r.error.message };
+      const jtGroups = chunkItems(jtWork, 10);
+      const jtPromise = mapConcurrent(jtGroups, getJtBulkConcurrency(), async (group) => {
+        const batch = await trackJtBatch(group.map((item) => item.waybill), { lang });
+        return group.map((item, index) => ({ item, result: summarizeForJson(batch[index]) }));
       });
       const [, jtOutcomes] = await Promise.all([nonJtPromise, jtPromise]);
-      jtOutcomes.forEach((outcome, index) => {
-        const item = jtWork[index];
-        results[item.index] = outcome instanceof Error ? { waybill: item.waybill, carrier: "jt", error: outcome.message } : outcome;
+      jtOutcomes.forEach((outcome, groupIndex) => {
+        const group = jtGroups[groupIndex];
+        if (outcome instanceof Error) group.forEach((item) => { results[item.index] = { waybill: item.waybill, carrier: "jt", error: outcome.message }; });
+        else outcome.forEach(({ item, result }) => { results[item.index] = result; });
       });
       return asTextContent(results);
     },
@@ -311,7 +313,7 @@ export function buildMcpServer(): McpServer {
     {
       title: "Track multiple waybills (full events)",
       description:
-        `Track up to 250 waybills in one call while preserving input order and per-item failures. Non-J&T calls run in parallel; J&T uses controlled concurrency (${getJtBulkConcurrency()} workers, configured by JT_BULK_CONCURRENCY). Returns full event timelines.`,
+        `Track up to 250 waybills in one call while preserving input order and per-item failures. Non-J&T calls run in parallel; J&T uses batches of up to 10 waybills per CAPTCHA (${getJtBulkConcurrency()} concurrent groups, configured by JT_BULK_CONCURRENCY). Returns full event timelines.`,
       inputSchema: {
         waybills: z
           .array(
@@ -390,23 +392,31 @@ export function buildMcpServer(): McpServer {
       }
 
       const nonJtResults = await Promise.all(otherItems.map((i) => runItem(i)));
-      const jtOutcomes = await mapConcurrent(jtItems, getJtBulkConcurrency(), runItem);
-      const jtResults: Out[] = jtOutcomes.map((outcome, index) => outcome instanceof Error
-        ? { waybill: jtItems[index].waybill, carrier: "jt", error: { message: outcome.message } }
+      const jtGroups = chunkItems(jtItems, 10);
+      const jtOutcomes = await mapConcurrent(jtGroups, getJtBulkConcurrency(), async (group) => {
+        const batch = await trackJtBatch(group.map((item) => item.waybill), { lang: group[0]?.lang });
+        return group.map((item, index): Out => ({
+          waybill: item.waybill, carrier: "jt", result: applyOrder(batch[index], sortOrder),
+        }));
+      });
+      const jtResults: Out[] = jtOutcomes.flatMap((outcome, groupIndex) => outcome instanceof Error
+        ? jtGroups[groupIndex].map((item) => ({ waybill: item.waybill, carrier: "jt", error: { message: outcome.message } }))
         : outcome);
 
       const merged = [...nonJtResults, ...jtResults];
 
-      // Preserve original input order.
-      const byKey = new Map(merged.map((m) => [m.waybill, m]));
-      const ordered: Out[] = resolvedItems.map(
-        (i) =>
-          byKey.get(i.waybill) ?? {
-            waybill: i.waybill,
-            carrier: i.carrier ?? "unknown",
-            error: { message: "Not processed" },
-          },
-      );
+      // Preserve original input order, including duplicate waybills.
+      const queues = new Map<string, Out[]>();
+      for (const item of merged) {
+        const key = `${item.carrier}\0${item.waybill}`;
+        const queue = queues.get(key) ?? [];
+        queue.push(item);
+        queues.set(key, queue);
+      }
+      const ordered: Out[] = resolvedItems.map((i) => {
+        const key = `${i.carrier ?? "unknown"}\0${i.waybill}`;
+        return queues.get(key)?.shift() ?? { waybill: i.waybill, carrier: i.carrier ?? "unknown", error: { message: "Not processed" } };
+      });
 
       // Normalize results for JSON output.
       const finalResults = ordered.map((o) =>
