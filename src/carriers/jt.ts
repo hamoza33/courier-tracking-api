@@ -5,6 +5,66 @@ import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
 import { normalizeStatus, extractUndeliveryReason } from "../normalize.js";
 
 const JT_URL = "https://www.jtexpress.me/KSA/trajectoryQuery";
+const CAPTCHA_SCRIPT = "https://ca.turing.captcha.qcloud.com/TCaptcha-global.js";
+const TWOCAPTCHA_API_URL = "https://api.2captcha.com";
+const TWOCAPTCHA_POLL_MS = 1000;
+const TWOCAPTCHA_TIMEOUT_MS = 120000;
+
+interface TencentSolution { ticket: string; randstr: string }
+interface TwoCaptchaResponse {
+  errorId?: number;
+  errorCode?: string;
+  errorDescription?: string;
+  taskId?: number;
+  status?: "processing" | "ready";
+  solution?: { ticket?: string; randstr?: string };
+}
+
+async function twoCaptchaRequest(path: string, body: unknown, signal?: AbortSignal): Promise<TwoCaptchaResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${TWOCAPTCHA_API_URL}/${path}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal,
+    });
+  } catch (error) {
+    throw new Error(`2Captcha ${path} request failed: ${(error as Error).message}`);
+  }
+  if (!response.ok) throw new Error(`2Captcha ${path} returned HTTP ${response.status}`);
+  let data: TwoCaptchaResponse;
+  try { data = await response.json() as TwoCaptchaResponse; }
+  catch { throw new Error(`2Captcha ${path} returned invalid JSON`); }
+  if (data.errorId) throw new Error(`2Captcha ${data.errorCode ?? "error"}: ${data.errorDescription ?? "unknown error"}`);
+  return data;
+}
+
+export async function solveTencentCaptcha(
+  apiKey: string, appId: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<TencentSolution> {
+  if (!apiKey.trim()) throw new Error("TWOCAPTCHA_API_KEY is empty");
+  if (!appId.trim()) throw new Error("Tencent captcha appId was not detected");
+  const created = await twoCaptchaRequest("createTask", {
+    clientKey: apiKey,
+    task: { type: "TencentTaskProxyless", websiteURL: JT_URL, appId, captchaScript: CAPTCHA_SCRIPT },
+  }, opts.signal);
+  if (!Number.isInteger(created.taskId) || !created.taskId) throw new Error("2Captcha createTask response did not contain a valid taskId");
+
+  const timeoutMs = opts.timeoutMs ?? TWOCAPTCHA_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, TWOCAPTCHA_POLL_MS);
+      opts.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(opts.signal?.reason ?? new Error("aborted")); }, { once: true });
+    });
+    const result = await twoCaptchaRequest("getTaskResult", { clientKey: apiKey, taskId: created.taskId }, opts.signal);
+    if (result.status === "processing") continue;
+    if (result.status !== "ready") throw new Error(`2Captcha returned unexpected task status: ${String(result.status)}`);
+    const ticket = result.solution?.ticket?.trim();
+    const randstr = result.solution?.randstr?.trim();
+    if (!ticket || !randstr) throw new Error("2Captcha ready response is missing ticket or randstr");
+    return { ticket, randstr };
+  }
+  throw new Error(`2Captcha Tencent task timed out after ${timeoutMs}ms`);
+}
 
 const JT_LANG_MAP: Record<string, string> = {
   en: "EN",
@@ -189,7 +249,8 @@ async function humanlikeDrag(
 
 async function solveAndTrack(
   browser: Browser,
-  waybillNo: string
+  waybillNo: string,
+  externalSolver = true,
 ): Promise<JtV2Response> {
   const context = await browser.newContext({
     userAgent:
@@ -197,15 +258,47 @@ async function solveAndTrack(
     viewport: { width: 1280, height: 800 },
   });
   const page = await context.newPage();
-  await page.addInitScript(() => {
+  await page.addInitScript(({ useExternalSolver }) => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
-  });
+    if (useExternalSolver) {
+      Object.defineProperty(window, "TencentCaptcha", {
+        configurable: true,
+        set(Original: unknown) { (window as unknown as { __TencentCaptchaOriginal: unknown }).__TencentCaptchaOriginal = Original; },
+        get() {
+          return function (...args: unknown[]) {
+            const callback = args.find((arg) => typeof arg === "function") as ((value: unknown) => void) | undefined;
+            const appId = args.find((arg) => typeof arg === "string" && /^\d{6,}$/.test(arg)) as string | undefined;
+            return { show() { window.dispatchEvent(new CustomEvent("jt-captcha-request", { detail: { appId } })); (window as unknown as { __jtCaptchaCallback?: typeof callback }).__jtCaptchaCallback = callback; }, destroy() {} };
+          };
+        },
+      });
+    }
+  }, { useExternalSolver: externalSolver });
+
+  if (externalSolver) {
+    await page.exposeFunction("__jtSolveTencent", async (appId: string) => {
+      const apiKey = process.env.TWOCAPTCHA_API_KEY;
+      if (!apiKey) throw new Error("TWOCAPTCHA_API_KEY is not configured");
+      return solveTencentCaptcha(apiKey, appId);
+    });
+    await page.addInitScript(() => {
+      window.addEventListener("jt-captcha-request", async (event) => {
+        const appId = (event as CustomEvent<{ appId?: string }>).detail?.appId;
+        try {
+          const solution = await (window as unknown as { __jtSolveTencent(id: string): Promise<TencentSolution> }).__jtSolveTencent(appId ?? "");
+          (window as unknown as { __jtCaptchaCallback?: (value: unknown) => void }).__jtCaptchaCallback?.({ ret: 0, ...solution });
+        } catch (error) {
+          (window as unknown as { __jtCaptchaError?: string }).__jtCaptchaError = String(error);
+        }
+      });
+    });
+  }
 
   const captchaImages: Record<string, Buffer> = {};
   let trackingData: JtV2Response | null = null;
 
   const trackingPromise = new Promise<JtV2Response | null>((resolve) => {
-    const timer = setTimeout(() => resolve(null), 25000);
+    const timer = setTimeout(() => resolve(null), externalSolver ? TWOCAPTCHA_TIMEOUT_MS + 15000 : 25000);
     page.on("response", async (response) => {
       const url = response.url();
       if (url.includes("cap_union_new_getcapbysig")) {
@@ -234,6 +327,15 @@ async function solveAndTrack(
       waitUntil: "domcontentloaded",
       timeout: 30000,
     });
+    if (externalSolver) {
+      trackingData = await trackingPromise;
+      if (!trackingData) {
+        const solverError = await page.evaluate(() => (window as unknown as { __jtCaptchaError?: string }).__jtCaptchaError);
+        throw new Error(solverError || "Tracking API not called after 2Captcha solve");
+      }
+      return trackingData;
+    }
+
     await page.waitForSelector(".tencent-captcha-dy__fg-item", {
       timeout: 15000,
     });
@@ -310,13 +412,18 @@ export async function trackJt(
 ): Promise<TrackResult> {
   const wb = waybillNo.trim();
 
-  const maxAttempts = 3;
+  const apiKeyConfigured = Boolean(process.env.TWOCAPTCHA_API_KEY?.trim());
+  const maxAttempts = apiKeyConfigured ? 4 : 3;
   let lastError: Error | null = null;
+  let externalFailure: string | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const browser = await getBrowser();
-      const response = await solveAndTrack(browser, wb);
+      // Prefer 2Captcha once when configured; preserve the proven local image
+      // solver as three fallback attempts (and as the no-key default).
+      const useExternalSolver = apiKeyConfigured && attempt === 1;
+      const response = await solveAndTrack(browser, wb, useExternalSolver);
 
       if (!response.succ && response.code !== 1) {
         throw new CarrierError(
@@ -356,14 +463,15 @@ export async function trackJt(
       };
     } catch (err) {
       lastError = err as Error;
+      if (apiKeyConfigured && attempt === 1) externalFailure = lastError.message;
       if (err instanceof CarrierError) throw err;
-      // Retry on captcha solve failures
+      // Retry captcha failures; after an external-solver error, use local fallback.
     }
   }
 
   throw new CarrierError(
     "jt",
-    `J&T Express slider captcha failed after ${maxAttempts} attempts: ${lastError?.message ?? "unknown"}`,
+    `J&T Express captcha failed after ${maxAttempts} attempts: ${lastError?.message ?? "unknown"}${externalFailure ? ` (2Captcha: ${externalFailure})` : ""}`,
     { statusCode: 502, captchaRequired: true }
   );
 }

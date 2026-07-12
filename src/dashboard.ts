@@ -123,7 +123,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 <body>
 <div class="container">
   <h1>Courier Tracking Dashboard <span class="api-status checking" id="apiStatus"><span class="api-dot"></span> Checking...</span></h1>
-  <p class="subtitle">Paste or upload tracking numbers, then track them all at once.</p>
+  <p class="subtitle">Paste or upload tracking numbers, then track them as a concurrent batch. J&amp;T requests use a controlled server-side worker pool.</p>
 
   <div class="error-banner" id="errorBanner">
     <span id="errorBannerMsg"></span>
@@ -337,13 +337,15 @@ async function startTracking() {
   msg.classList.remove('error');
   bar.classList.add('active');
   fill.style.width = '10%';
-  msg.textContent = 'Tracking ' + waybills.length + ' waybill(s)...';
+  msg.textContent = 'Submitting ' + waybills.length + ' waybill(s) for concurrent batch processing...';
 
   let progress = 10;
+  const startedAt = Date.now();
   const timer = setInterval(() => {
-    progress = Math.min(progress + Math.random() * 8, 90);
+    progress = Math.min(progress + Math.max(0.5, (90 - progress) * 0.04), 90);
     fill.style.width = progress + '%';
-  }, 500);
+    msg.textContent = 'Batch processing in parallel on the server — ' + Math.round((Date.now() - startedAt) / 1000) + 's elapsed (J&T concurrency is controlled).';
+  }, 1000);
 
   try {
     const resp = await fetchWithRetry('/track/bulk', {

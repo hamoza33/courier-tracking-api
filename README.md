@@ -62,9 +62,9 @@ Same as above but with the carrier as a path parameter.
 
 ### `POST /track/bulk`
 
-Track up to **250 waybills** in a single request. All carriers except J&T Express
-are processed in parallel. J&T waybills are processed **one-by-one** (sequentially)
-to handle the CAPTCHA requirement.
+Track up to **250 waybills** in a single request. Non-J&T work runs in parallel;
+J&T uses a controlled worker pool (`JT_BULK_CONCURRENCY`, default `5`, clamped
+to `1..10`). Results preserve input order and failures remain isolated per item.
 
 **Request body:**
 
@@ -220,19 +220,21 @@ curl -s "https://tracking.shopinzo.bond/track/imile/6050926815554?order=asc" | j
 J&T Express's KSA website (`jtexpress.me`) protects its tracking API with
 **Tencent Cloud (TJN) Captcha** – a slider puzzle captcha.
 
-This project **automatically solves the captcha** using:
+This project first uses **2Captcha TencentTaskProxyless** when
+`TWOCAPTCHA_API_KEY` is configured:
 
-1. **Playwright** – headless Chromium loads the J&T tracking page.
-2. **Template matching with Sobel edge detection** – the slider background
-   and puzzle piece images are captured from the page's network requests,
-   processed locally using Sharp, and the correct X-offset is found via
-   normalized cross-correlation on Sobel edge maps.
-3. **Humanlike drag** – a natural mouse movement with easing, jitter, and
-   overshoot drags the slider to the correct position.
-4. The page's own tracking API call is intercepted to capture the response.
+1. Playwright loads the J&T page and captures the Tencent app ID.
+2. A task is created with the exact captcha script
+   `https://ca.turing.captcha.qcloud.com/TCaptcha-global.js`.
+3. The task is polled every second (with timeout, response validation, and
+   explicit provider/network errors).
+4. Both returned values, `ticket` and `randstr`, are passed into the page's
+   existing captcha callback so the normal J&T tracking request continues.
 
-No external captcha-solving service is needed. The solver retries up to
-3 times if the drag fails.
+If no key is configured, or the external solve fails, the existing local
+Playwright image solver remains available as fallback. It captures the slider
+images, applies Sobel/template matching, performs a humanlike drag, and
+intercepts the v2 tracking response. No credentials are stored in the code.
 
 J&T now uses a v2 API endpoint:
 `POST https://ofmg.jtjms-sa.com/official/logisticsTracking/v2/getDetailByWaybillNo`
@@ -299,6 +301,10 @@ npm run build && npm start
 | `LOG_LEVEL`                  | `info`                        | Pino log level                                |
 | `RATE_LIMIT_MAX`             | `60`                          | Requests per window per IP                    |
 | `RATE_LIMIT_WINDOW`          | `1 minute`                    | Rate-limit window                             |
+| `TWOCAPTCHA_API_KEY`         | unset                         | Optional 2Captcha key for J&T TencentTaskProxyless; local solver is fallback |
+| `JT_BULK_CONCURRENCY`        | `5`                           | Concurrent J&T workers for REST, benchmark, and MCP bulk/summary paths; clamped to 1..10 |
+| `MCP_AUTH_TOKEN`             | unset                         | MCP OAuth/admin bearer token                  |
+| `MCP_PUBLIC_URL`             | production URL                | Public base URL used by MCP OAuth metadata    |
 
 ---
 
@@ -342,9 +348,12 @@ Plain HTML site. We POST `order=<waybill>` to
 
 ### J&T Express
 
-Playwright-based automatic captcha solving. Loads the tracking page, solves
-the Tencent TJN slider captcha via local template matching (Sobel edge
-detection + NCC), and intercepts the v2 tracking API response.
+Playwright loads the tracking page and, when `TWOCAPTCHA_API_KEY` is set,
+solves Tencent through 2Captcha's `TencentTaskProxyless` task. The resulting
+`ticket` and `randstr` are delivered to the page callback end-to-end. Robust
+one-second polling is bounded by a timeout and validates provider responses.
+The local slider solver (Sobel edge detection + NCC + humanlike drag) is kept
+as a fallback.
 
 ### JDW Logistics (JINGDONG)
 

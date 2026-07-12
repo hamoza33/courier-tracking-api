@@ -28,6 +28,7 @@ import {
   normalizeForJson,
   type FormatOptions,
 } from "./format.js";
+import { getJtBulkConcurrency, mapConcurrent, resolveBulkCarrier } from "./bulk.js";
 import { DASHBOARD_HTML } from "./dashboard.js";
 
 type MultiTrackResult = { carrier: string; result?: TrackResult; error?: { message: string; captchaRequired?: boolean } };
@@ -639,7 +640,7 @@ async function start() {
     {
       schema: {
         tags: ["tracking"],
-        summary: "Track up to 250 waybills at once. J&T waybills are processed sequentially (CAPTCHA).",
+        summary: `Track up to 250 waybills at once. J&T uses controlled concurrency (${getJtBulkConcurrency()} workers).`,
         body: {
           type: "object",
           required: ["waybills"],
@@ -685,48 +686,26 @@ async function start() {
         typeof w === "string" ? { waybill: w, lang: defaultLang } : { ...w, lang: w.lang ?? defaultLang }
       );
 
-      // Separate J&T from non-J&T for special handling
-      const jtItems: BulkItem[] = [];
-      const nonJtItems: BulkItem[] = [];
+      const jtConcurrency = getJtBulkConcurrency();
+      const indexed = items.map((item, index) => ({ item, index, carrier: resolveBulkCarrier(item.waybill, item.carrier) }));
+      const orderedResults = new Array<BulkResultItem>(items.length);
 
-      for (const item of items) {
-        const carrierHint = item.carrier?.toLowerCase() ?? "auto";
-        let resolved: Carrier | null = null;
-        if (carrierHint !== "auto" && ALL_CARRIERS.includes(carrierHint as Carrier)) {
-          resolved = carrierHint as Carrier;
-        } else {
-          resolved = detectCarrier(item.waybill.trim());
-        }
-        if (resolved === "jt") {
-          jtItems.push(item);
-        } else {
-          nonJtItems.push(item);
-        }
-      }
+      const nonJtPromise = Promise.all(indexed.filter((entry) => entry.carrier !== "jt").map(async (entry) => {
+        orderedResults[entry.index] = await trackOneBulk(entry.item);
+      }));
+      const jtEntries = indexed.filter((entry) => entry.carrier === "jt");
+      const jtPromise = mapConcurrent(jtEntries, jtConcurrency, async (entry) => trackOneBulk(entry.item));
+      const [, jtOutcomes] = await Promise.all([nonJtPromise, jtPromise]);
+      jtOutcomes.forEach((outcome, index) => {
+        const entry = jtEntries[index];
+        orderedResults[entry.index] = outcome instanceof Error
+          ? { waybill: entry.item.waybill.trim(), carrier: "jt", error: { message: outcome.message } }
+          : outcome;
+      });
 
-      // Non-J&T: process all in parallel
-      const nonJtPromises = nonJtItems.map((item) => trackOneBulk(item));
-      const nonJtResults = await Promise.all(nonJtPromises);
-
-      // J&T: process sequentially (one-by-one) due to CAPTCHA
-      const jtResults: BulkResultItem[] = [];
-      for (const item of jtItems) {
-        const res = await trackOneBulk(item);
-        jtResults.push(res);
-      }
-
-      const allResults = [...nonJtResults, ...jtResults];
-
-      // Apply ordering to each result
-      for (const item of allResults) {
+      for (const item of orderedResults) {
         if (item.result) applyOrder(item.result, order);
       }
-
-      // Maintain original input order
-      const orderedResults: BulkResultItem[] = items.map((item) => {
-        const waybill = item.waybill.trim();
-        return allResults.find((r) => r.waybill === waybill) ?? { waybill, carrier: "unknown", error: { message: "Not processed" } };
-      });
 
       return reply.send({
         total: orderedResults.length,
@@ -780,39 +759,24 @@ async function start() {
         typeof w === "string" ? { waybill: w, lang: defaultLang } : { ...w, lang: w.lang ?? defaultLang }
       );
 
-      // Helper: run a batch with J&T sequential, others parallel
+      // Helper: run non-J&T without a limit and J&T with the configured worker pool.
       async function runBatch(batch: BulkItem[]): Promise<{ results: BulkResultItem[]; durationMs: number }> {
         const start = performance.now();
-
-        const jtBatch: BulkItem[] = [];
-        const nonJtBatch: BulkItem[] = [];
-
-        for (const item of batch) {
-          const carrierHint = item.carrier?.toLowerCase() ?? "auto";
-          let resolved: Carrier | null = null;
-          if (carrierHint !== "auto" && ALL_CARRIERS.includes(carrierHint as Carrier)) {
-            resolved = carrierHint as Carrier;
-          } else {
-            resolved = detectCarrier(item.waybill.trim());
-          }
-          if (resolved === "jt") {
-            jtBatch.push(item);
-          } else {
-            nonJtBatch.push(item);
-          }
-        }
-
-        // Non-J&T in parallel
-        const nonJtResults = await Promise.all(nonJtBatch.map((item) => trackOneBulk(item)));
-
-        // J&T sequential
-        const jtResults: BulkResultItem[] = [];
-        for (const item of jtBatch) {
-          jtResults.push(await trackOneBulk(item));
-        }
-
-        const durationMs = Math.round(performance.now() - start);
-        return { results: [...nonJtResults, ...jtResults], durationMs };
+        const indexed = batch.map((item, index) => ({ item, index, carrier: resolveBulkCarrier(item.waybill, item.carrier) }));
+        const results = new Array<BulkResultItem>(batch.length);
+        const nonJtPromise = Promise.all(indexed.filter((entry) => entry.carrier !== "jt").map(async (entry) => {
+          results[entry.index] = await trackOneBulk(entry.item);
+        }));
+        const jtEntries = indexed.filter((entry) => entry.carrier === "jt");
+        const jtPromise = mapConcurrent(jtEntries, getJtBulkConcurrency(), async (entry) => trackOneBulk(entry.item));
+        const [, outcomes] = await Promise.all([nonJtPromise, jtPromise]);
+        outcomes.forEach((outcome, index) => {
+          const entry = jtEntries[index];
+          results[entry.index] = outcome instanceof Error
+            ? { waybill: entry.item.waybill.trim(), carrier: "jt", error: { message: outcome.message } }
+            : outcome;
+        });
+        return { results, durationMs: Math.round(performance.now() - start) };
       }
 
       // Batch of 50 (first 50 items or all if less than 50)

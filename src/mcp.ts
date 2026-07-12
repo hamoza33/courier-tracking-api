@@ -19,6 +19,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
+import { getJtBulkConcurrency, mapConcurrent } from "./bulk.js";
 import { ALL_CARRIERS, CARRIER_NAMES, detectCarrier } from "./detect.js";
 import { trackImile } from "./carriers/imile.js";
 import { trackInjaz } from "./carriers/injaz.js";
@@ -211,7 +212,7 @@ export function buildMcpServer(): McpServer {
     {
       title: "Shipment summary with key events",
       description:
-        "Returns all shipment metadata (normalizedStatus, latestStatus, latestStatusDetail, latestTime, undeliveryReason, originCity, destinationCity, extra carrier data) plus the first and last events for context. Use this when you need a quick overview without downloading the entire event timeline. For bulk status checks, use track_bulk instead.",
+        `Returns all shipment metadata plus first/last events for up to 50 waybills. Non-J&T work runs in parallel; J&T uses controlled concurrency (${getJtBulkConcurrency()} workers, configured by JT_BULK_CONCURRENCY).`,
       inputSchema: {
         waybills: z
           .array(z.string().min(1))
@@ -222,20 +223,23 @@ export function buildMcpServer(): McpServer {
       },
     },
     async ({ waybills, lang }) => {
-      const results = await Promise.all(
-        waybills.map(async (wb) => {
-          const trimmed = wb.trim();
-          const carrier = detectCarrier(trimmed);
-          if (!carrier) {
-            return { waybill: trimmed, error: "Could not detect carrier" };
-          }
-          const r = await runOne(carrier, trimmed, lang);
-          if (!r.ok) {
-            return { waybill: trimmed, carrier, error: r.error.message };
-          }
-          return summarizeForJson(r.result);
-        }),
-      );
+      const work = waybills.map((wb, index) => ({ index, waybill: wb.trim(), carrier: detectCarrier(wb.trim()) }));
+      const results = new Array<unknown>(work.length);
+      const nonJtPromise = Promise.all(work.filter((item) => item.carrier !== "jt").map(async ({ index, waybill: trimmed, carrier }) => {
+        if (!carrier) { results[index] = { waybill: trimmed, error: "Could not detect carrier" }; return; }
+        const r = await runOne(carrier, trimmed, lang);
+        results[index] = r.ok ? summarizeForJson(r.result) : { waybill: trimmed, carrier, error: r.error.message };
+      }));
+      const jtWork = work.filter((item) => item.carrier === "jt");
+      const jtPromise = mapConcurrent(jtWork, getJtBulkConcurrency(), async ({ waybill: trimmed, carrier }) => {
+        const r = await runOne(carrier!, trimmed, lang);
+        return r.ok ? summarizeForJson(r.result) : { waybill: trimmed, carrier, error: r.error.message };
+      });
+      const [, jtOutcomes] = await Promise.all([nonJtPromise, jtPromise]);
+      jtOutcomes.forEach((outcome, index) => {
+        const item = jtWork[index];
+        results[item.index] = outcome instanceof Error ? { waybill: item.waybill, carrier: "jt", error: outcome.message } : outcome;
+      });
       return asTextContent(results);
     },
   );
@@ -307,7 +311,7 @@ export function buildMcpServer(): McpServer {
     {
       title: "Track multiple waybills (full events)",
       description:
-        "Track up to 250 waybills in a single call. Returns full event timelines for each. Each result includes: carrier, carrierName, waybillNo, found, normalizedStatus, latestStatus, latestStatusDetail, latestTime, undeliveryReason, events[], and extra carrier data. Non-J&T waybills are processed in parallel; J&T waybills are processed sequentially because of CAPTCHA.",
+        `Track up to 250 waybills in one call while preserving input order and per-item failures. Non-J&T calls run in parallel; J&T uses controlled concurrency (${getJtBulkConcurrency()} workers, configured by JT_BULK_CONCURRENCY). Returns full event timelines.`,
       inputSchema: {
         waybills: z
           .array(
@@ -386,10 +390,10 @@ export function buildMcpServer(): McpServer {
       }
 
       const nonJtResults = await Promise.all(otherItems.map((i) => runItem(i)));
-      const jtResults: Out[] = [];
-      for (const item of jtItems) {
-        jtResults.push(await runItem(item));
-      }
+      const jtOutcomes = await mapConcurrent(jtItems, getJtBulkConcurrency(), runItem);
+      const jtResults: Out[] = jtOutcomes.map((outcome, index) => outcome instanceof Error
+        ? { waybill: jtItems[index].waybill, carrier: "jt", error: { message: outcome.message } }
+        : outcome);
 
       const merged = [...nonJtResults, ...jtResults];
 
