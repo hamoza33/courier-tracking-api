@@ -19,11 +19,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import { getJtBulkConcurrency, mapConcurrent } from "./bulk.js";
+import { chunkItems, getJtBulkConcurrency, mapConcurrent } from "./bulk.js";
 import { ALL_CARRIERS, CARRIER_NAMES, detectCarrier } from "./detect.js";
 import { trackImile } from "./carriers/imile.js";
 import { trackInjaz } from "./carriers/injaz.js";
-import { trackJt } from "./carriers/jt.js";
+import { getJtProviderBatchSize, trackJt, trackJtBatch } from "./carriers/jt-provider.js";
 import { trackJdw } from "./carriers/jdw.js";
 import { trackNaqel } from "./carriers/naqel.js";
 import { normalizeForJson, summarizeForJson } from "./format.js";
@@ -31,6 +31,8 @@ import { CarrierError, type Carrier, type TrackResult } from "./types.js";
 
 const CARRIER_VALUES = ["imile", "injaz", "jt", "jdw", "naqel", "auto"] as const;
 const ORDER_VALUES = ["desc", "asc"] as const;
+const JT_PROVIDER_VALUES = ["auto", "trackingmore", "tencent"] as const;
+type JtProvider = (typeof JT_PROVIDER_VALUES)[number];
 
 type Order = (typeof ORDER_VALUES)[number];
 
@@ -38,7 +40,7 @@ type RunResult =
   | { ok: true; result: TrackResult }
   | { ok: false; error: { message: string; carrier?: Carrier; captchaRequired?: boolean } };
 
-async function runOne(carrier: Carrier, waybill: string, lang?: string): Promise<RunResult> {
+async function runOne(carrier: Carrier, waybill: string, lang?: string, jtProvider: JtProvider = "auto"): Promise<RunResult> {
   try {
     let result: TrackResult;
     switch (carrier) {
@@ -49,7 +51,7 @@ async function runOne(carrier: Carrier, waybill: string, lang?: string): Promise
         result = await trackInjaz(waybill);
         break;
       case "jt":
-        result = await trackJt(waybill, { lang });
+        result = await trackJt(waybill, { lang, provider: jtProvider });
         break;
       case "jdw":
         result = await trackJdw(waybill, lang);
@@ -169,9 +171,11 @@ export function buildMcpServer(): McpServer {
           .string()
           .optional()
           .describe("Language hint for carriers that support it (e.g. 'en', 'ar', 'zh-CN')."),
+        jtProvider: z.enum(JT_PROVIDER_VALUES).optional().default("auto")
+          .describe("J&T provider: auto (TrackingMore primary, Tencent fallback), trackingmore only, or tencent only."),
       },
     },
-    async ({ waybill, carrier, lang }) => {
+    async ({ waybill, carrier, lang, jtProvider }) => {
       const trimmed = waybill.trim();
       const carrierHint = carrier ?? "auto";
 
@@ -183,7 +187,7 @@ export function buildMcpServer(): McpServer {
       }
 
       if (resolved) {
-        const r = await runOne(resolved, trimmed, lang);
+        const r = await runOne(resolved, trimmed, lang, jtProvider);
         if (!r.ok) {
           return asErrorContent(r.error.message, {
             carrier: r.error.carrier,
@@ -196,7 +200,7 @@ export function buildMcpServer(): McpServer {
       // Fan out to all carriers
       const fanout = await Promise.all(
         ALL_CARRIERS.map(async (c) => {
-          const r = await runOne(c, trimmed, lang);
+          const r = await runOne(c, trimmed, lang, jtProvider);
           if (r.ok && r.result.found) return summarizeForJson(r.result);
           return null;
         }),
@@ -212,7 +216,7 @@ export function buildMcpServer(): McpServer {
     {
       title: "Shipment summary with key events",
       description:
-        `Returns all shipment metadata plus first/last events for up to 50 waybills. Non-J&T work runs in parallel; J&T uses controlled concurrency (${getJtBulkConcurrency()} workers, configured by JT_BULK_CONCURRENCY).`,
+        `Returns all shipment metadata plus first/last events for up to 50 waybills. Non-J&T work runs in parallel; J&T uses TrackingMore/auto batches of up to 20 and Tencent batches of up to 10 (${getJtBulkConcurrency()} concurrent groups, configured by JT_BULK_CONCURRENCY).`,
       inputSchema: {
         waybills: z
           .array(z.string().min(1))
@@ -220,25 +224,28 @@ export function buildMcpServer(): McpServer {
           .max(50)
           .describe("Array of waybill numbers to summarize (up to 50)."),
         lang: z.string().optional().describe("Language hint for carriers that support it."),
+        jtProvider: z.enum(JT_PROVIDER_VALUES).optional().default("auto").describe("J&T provider (default auto)."),
       },
     },
-    async ({ waybills, lang }) => {
+    async ({ waybills, lang, jtProvider }) => {
       const work = waybills.map((wb, index) => ({ index, waybill: wb.trim(), carrier: detectCarrier(wb.trim()) }));
       const results = new Array<unknown>(work.length);
       const nonJtPromise = Promise.all(work.filter((item) => item.carrier !== "jt").map(async ({ index, waybill: trimmed, carrier }) => {
         if (!carrier) { results[index] = { waybill: trimmed, error: "Could not detect carrier" }; return; }
-        const r = await runOne(carrier, trimmed, lang);
+        const r = await runOne(carrier, trimmed, lang, jtProvider);
         results[index] = r.ok ? summarizeForJson(r.result) : { waybill: trimmed, carrier, error: r.error.message };
       }));
       const jtWork = work.filter((item) => item.carrier === "jt");
-      const jtPromise = mapConcurrent(jtWork, getJtBulkConcurrency(), async ({ waybill: trimmed, carrier }) => {
-        const r = await runOne(carrier!, trimmed, lang);
-        return r.ok ? summarizeForJson(r.result) : { waybill: trimmed, carrier, error: r.error.message };
+      const jtGroups = chunkItems(jtWork, getJtProviderBatchSize(jtProvider));
+      const jtPromise = mapConcurrent(jtGroups, getJtBulkConcurrency(), async (group) => {
+        const batch = await trackJtBatch(group.map((item) => item.waybill), { lang, provider: jtProvider });
+        return group.map((item, index) => ({ item, result: summarizeForJson(batch[index]) }));
       });
       const [, jtOutcomes] = await Promise.all([nonJtPromise, jtPromise]);
-      jtOutcomes.forEach((outcome, index) => {
-        const item = jtWork[index];
-        results[item.index] = outcome instanceof Error ? { waybill: item.waybill, carrier: "jt", error: outcome.message } : outcome;
+      jtOutcomes.forEach((outcome, groupIndex) => {
+        const group = jtGroups[groupIndex];
+        if (outcome instanceof Error) group.forEach((item) => { results[item.index] = { waybill: item.waybill, carrier: "jt", error: outcome.message }; });
+        else outcome.forEach(({ item, result }) => { results[item.index] = result; });
       });
       return asTextContent(results);
     },
@@ -260,13 +267,15 @@ export function buildMcpServer(): McpServer {
           .string()
           .optional()
           .describe("Language hint for carriers that support it (e.g. 'en', 'ar', 'zh-CN')."),
+        jtProvider: z.enum(JT_PROVIDER_VALUES).optional().default("auto")
+          .describe("J&T provider: auto (TrackingMore primary, Tencent fallback), trackingmore only, or tencent only."),
         order: z
           .enum(ORDER_VALUES)
           .optional()
           .describe("Event sort order — 'desc' (default, newest first) or 'asc' (oldest first)."),
       },
     },
-    async ({ waybill, carrier, lang, order }) => {
+    async ({ waybill, carrier, lang, jtProvider, order }) => {
       const trimmed = waybill.trim();
       const sortOrder: Order = order ?? "desc";
       const carrierHint = carrier ?? "auto";
@@ -279,7 +288,7 @@ export function buildMcpServer(): McpServer {
       }
 
       if (resolved) {
-        const r = await runOne(resolved, trimmed, lang);
+        const r = await runOne(resolved, trimmed, lang, jtProvider);
         if (!r.ok) {
           return asErrorContent(r.error.message, {
             carrier: r.error.carrier,
@@ -292,7 +301,7 @@ export function buildMcpServer(): McpServer {
       // Detection failed and caller did not pin a carrier -> fan out.
       const fanout = await Promise.all(
         ALL_CARRIERS.map(async (c) => {
-          const r = await runOne(c, trimmed, lang);
+          const r = await runOne(c, trimmed, lang, jtProvider);
           if (r.ok) {
             return { carrier: c, result: normalizeForJson(applyOrder(r.result, sortOrder), { order: sortOrder }) };
           }
@@ -311,7 +320,7 @@ export function buildMcpServer(): McpServer {
     {
       title: "Track multiple waybills (full events)",
       description:
-        `Track up to 250 waybills in one call while preserving input order and per-item failures. Non-J&T calls run in parallel; J&T uses controlled concurrency (${getJtBulkConcurrency()} workers, configured by JT_BULK_CONCURRENCY). Returns full event timelines.`,
+        `Track up to 250 waybills in one call while preserving input order and per-item failures. Non-J&T calls run in parallel; J&T uses TrackingMore/auto batches of up to 20 and Tencent batches of up to 10 (${getJtBulkConcurrency()} concurrent groups, configured by JT_BULK_CONCURRENCY). Returns full event timelines.`,
       inputSchema: {
         waybills: z
           .array(
@@ -321,6 +330,7 @@ export function buildMcpServer(): McpServer {
                 waybill: z.string().min(1),
                 carrier: z.enum(CARRIER_VALUES).optional(),
                 lang: z.string().optional(),
+                jtProvider: z.enum(JT_PROVIDER_VALUES).optional(),
               }),
             ]),
           )
@@ -330,20 +340,21 @@ export function buildMcpServer(): McpServer {
             "Array of waybill numbers (strings) or { waybill, carrier?, lang? } objects. Up to 250 items.",
           ),
         lang: z.string().optional().describe("Default language for all waybills."),
+        jtProvider: z.enum(JT_PROVIDER_VALUES).optional().default("auto").describe("Default J&T provider; per-item value overrides it."),
         order: z.enum(ORDER_VALUES).optional().describe("Event sort order. Default 'desc'."),
       },
     },
-    async ({ waybills, lang: defaultLang, order }) => {
+    async ({ waybills, lang: defaultLang, jtProvider: defaultJtProvider, order }) => {
       const sortOrder: Order = order ?? "desc";
 
       const items = waybills.map((w) =>
         typeof w === "string"
-          ? { waybill: w, carrier: "auto" as const, lang: defaultLang }
-          : { waybill: w.waybill, carrier: w.carrier ?? "auto", lang: w.lang ?? defaultLang },
+          ? { waybill: w, carrier: "auto" as const, lang: defaultLang, jtProvider: defaultJtProvider }
+          : { waybill: w.waybill, carrier: w.carrier ?? "auto", lang: w.lang ?? defaultLang, jtProvider: w.jtProvider ?? defaultJtProvider },
       );
 
       // Resolve carrier for each item; split J&T vs non-J&T.
-      type ResolvedItem = { waybill: string; carrier: Carrier | null; lang?: string };
+      type ResolvedItem = { waybill: string; carrier: Carrier | null; lang?: string; jtProvider: JtProvider };
       const resolvedItems: ResolvedItem[] = items.map((i) => {
         const trimmed = i.waybill.trim();
         const hint = i.carrier;
@@ -353,7 +364,7 @@ export function buildMcpServer(): McpServer {
         } else {
           carrier = detectCarrier(trimmed);
         }
-        return { waybill: trimmed, carrier, lang: i.lang };
+        return { waybill: trimmed, carrier, lang: i.lang, jtProvider: i.jtProvider };
       });
 
       const jtItems = resolvedItems.filter((i) => i.carrier === "jt");
@@ -374,7 +385,7 @@ export function buildMcpServer(): McpServer {
             error: { message: "Could not detect carrier for this waybill" },
           };
         }
-        const r = await runOne(item.carrier, item.waybill, item.lang);
+        const r = await runOne(item.carrier, item.waybill, item.lang, item.jtProvider);
         if (!r.ok) {
           return {
             waybill: item.waybill,
@@ -390,23 +401,35 @@ export function buildMcpServer(): McpServer {
       }
 
       const nonJtResults = await Promise.all(otherItems.map((i) => runItem(i)));
-      const jtOutcomes = await mapConcurrent(jtItems, getJtBulkConcurrency(), runItem);
-      const jtResults: Out[] = jtOutcomes.map((outcome, index) => outcome instanceof Error
-        ? { waybill: jtItems[index].waybill, carrier: "jt", error: { message: outcome.message } }
+      const jtGroups = [...new Set(jtItems.map((item) => item.jtProvider))]
+        .flatMap((provider) => chunkItems(
+          jtItems.filter((item) => item.jtProvider === provider),
+          getJtProviderBatchSize(provider),
+        ));
+      const jtOutcomes = await mapConcurrent(jtGroups, getJtBulkConcurrency(), async (group) => {
+        const batch = await trackJtBatch(group.map((item) => item.waybill), { lang: group[0]?.lang, provider: group[0]?.jtProvider });
+        return group.map((item, index): Out => ({
+          waybill: item.waybill, carrier: "jt", result: applyOrder(batch[index], sortOrder),
+        }));
+      });
+      const jtResults: Out[] = jtOutcomes.flatMap((outcome, groupIndex) => outcome instanceof Error
+        ? jtGroups[groupIndex].map((item) => ({ waybill: item.waybill, carrier: "jt", error: { message: outcome.message } }))
         : outcome);
 
       const merged = [...nonJtResults, ...jtResults];
 
-      // Preserve original input order.
-      const byKey = new Map(merged.map((m) => [m.waybill, m]));
-      const ordered: Out[] = resolvedItems.map(
-        (i) =>
-          byKey.get(i.waybill) ?? {
-            waybill: i.waybill,
-            carrier: i.carrier ?? "unknown",
-            error: { message: "Not processed" },
-          },
-      );
+      // Preserve original input order, including duplicate waybills.
+      const queues = new Map<string, Out[]>();
+      for (const item of merged) {
+        const key = `${item.carrier}\0${item.waybill}`;
+        const queue = queues.get(key) ?? [];
+        queue.push(item);
+        queues.set(key, queue);
+      }
+      const ordered: Out[] = resolvedItems.map((i) => {
+        const key = `${i.carrier ?? "unknown"}\0${i.waybill}`;
+        return queues.get(key)?.shift() ?? { waybill: i.waybill, carrier: i.carrier ?? "unknown", error: { message: "Not processed" } };
+      });
 
       // Normalize results for JSON output.
       const finalResults = ordered.map((o) =>

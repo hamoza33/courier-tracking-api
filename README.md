@@ -7,7 +7,7 @@ five Middle-East courier services:
 | -------- | --------------------------- | ---------------------------- |
 | `imile`  | iMile                       | No                           |
 | `injaz`  | Injaz Express               | No                           |
-| `jt`     | J&T Express                 | **Yes – solved automatically via Playwright** |
+| `jt`     | J&T Express                 | TrackingMore Turnstile; Tencent fallback |
 | `jdw`    | JDW Logistics (JINGDONG)    | No                           |
 | `naqel`  | Naqel Express               | No                           |
 
@@ -28,13 +28,14 @@ refresh statuses on demand.
 
 ## Endpoints
 
-### `GET /track?waybill={no}[&carrier={code}][&lang=en][&format=text][&pretty=1][&order=desc]`
+### `GET /track?waybill={no}[&carrier={code}][&jtProvider=auto][&lang=en][&format=text][&pretty=1][&order=desc]`
 
 Returns the tracking events for a single waybill.
 
 - `waybill` (required) – the tracking number.
 - `carrier` (optional) – one of `imile`, `injaz`, `jt`, `jdw`, `naqel`, or
   `auto` (the default). Set to `all` to fan out to every carrier in parallel.
+- `jtProvider` (optional) – `auto` (default: TrackingMore first, Tencent fallback only if the provider fails), `trackingmore` (no fallback), or `tencent` (no fallback).
 - `lang` (optional) – language hint for carriers that support it
   (`en`, `ar`, `zh-CN`).
 - `format` (optional) – `json` (default) or `text`. With `text`, the
@@ -56,9 +57,9 @@ The carrier is auto-detected when omitted:
 If detection fails the API automatically fans out to all five carriers
 and returns an array.
 
-### `GET /track/{carrier}/{waybill}[?lang=en&order=desc]`
+### `GET /track/{carrier}/{waybill}[?jtProvider=auto&lang=en&order=desc]`
 
-Same as above but with the carrier as a path parameter.
+Same as above but with the carrier as a path parameter. `jtProvider` applies when `carrier=jt`.
 
 ### `POST /track/bulk`
 
@@ -72,17 +73,18 @@ to `1..10`). Results preserve input order and failures remain isolated per item.
 {
   "waybills": ["6050926815554", "JDW101107292775", "JTE000944462953"],
   "lang": "en",
+  "jtProvider": "auto",
   "order": "desc"
 }
 ```
 
-Each item in `waybills` can be a plain string (carrier auto-detected) or an object:
+Each item in `waybills` can be a plain string (carrier auto-detected) or an object. Top-level `jtProvider` is the default, and a per-item `jtProvider` overrides it. TrackingMore and auto groups are capped at 20, Tencent groups at 10, and different provider selections are never mixed in one group:
 
 ```json
 {
   "waybills": [
     "6050926815554",
-    { "waybill": "JTE000944462953", "carrier": "jt" }
+    { "waybill": "JTE000944462953", "carrier": "jt", "jtProvider": "trackingmore" }
   ]
 }
 ```
@@ -215,29 +217,32 @@ curl -s "https://tracking.shopinzo.bond/track/imile/6050926815554?order=asc" | j
 
 ---
 
-## CAPTCHA handling (J&T Express)
+## J&T provider and CAPTCHA fallback chains
 
-J&T Express's KSA website (`jtexpress.me`) protects its tracking API with
-**Tencent Cloud (TJN) Captcha** – a slider puzzle captcha.
+J&T has two separate fallback layers:
 
-This project first uses **2Captcha TencentTaskProxyless** when
-`TWOCAPTCHA_API_KEY` is configured:
+### Tracking provider selection
 
-1. Playwright loads the J&T page and captures the Tencent app ID.
-2. A task is created with the exact captcha script
-   `https://ca.turing.captcha.qcloud.com/TCaptcha-global.js`.
-3. The task is polled every second (with timeout, response validation, and
-   explicit provider/network errors).
-4. Both returned values, `ticket` and `randstr`, are passed into the page's
-   existing captcha callback so the normal J&T tracking request continues.
+1. **TrackingMore** is primary. The adapter navigates directly to
+   `https://www.trackingmore.com/track?number=<encoded-comma-separated-numbers>&express=jtexpress-ae&lang=en`.
+2. **Tencent/J&T native tracking** is the provider fallback.
 
-If no key is configured, or the external solve fails, the existing local
-Playwright image solver remains available as fallback. It captures the slider
-images, applies Sobel/template matching, performs a humanlike drag, and
-intercepts the v2 tracking response. No credentials are stored in the code.
+With `jtProvider=auto` (the default), TrackingMore is attempted first. Tencent is called only if the TrackingMore request throws or fails; a valid TrackingMore “not found” result does not trigger fallback. A failed TrackingMore group of up to 20 is split into Tencent groups of at most 10. Input order and duplicate waybills are preserved.
 
-J&T now uses a v2 API endpoint:
-`POST https://ofmg.jtjms-sa.com/official/logisticsTracking/v2/getDetailByWaybillNo`
+Explicit `jtProvider=trackingmore` and `jtProvider=tencent` modes never switch tracking providers. Results are annotated in `extra` with `source`, `provider`, `requestedProvider`, and `fallback`; provider fallback also adds a warning.
+
+### TrackingMore Turnstile solver selection
+
+For a TrackingMore challenge, CAPTCHA solvers are attempted in this order:
+
+1. **Capsolver** — `AntiTurnstileTaskProxyLess`, configured with `CAPSOLVER_API_KEY`.
+2. **2Captcha** — `TurnstileTaskProxyless`, configured with `TWOCAPTCHA_API_KEY`, called only if Capsolver is absent or fails.
+
+A successful Capsolver solve never creates a duplicate paid 2Captcha task. Both services return a Turnstile token; the Playwright page submits it through TrackingMore's existing callback and waits until every corresponding `app.trackEnd` entry has `loading: false`. A warm reusable Chromium process and resource blocking reduce latency, while each request uses an isolated browser context.
+
+The Tencent implementation separately uses **2Captcha `TencentTaskProxyless`** when configured, then retains its local Playwright slider solver as an internal fallback.
+
+Bulk REST, benchmark, dashboard, and MCP paths all use the same provider rules: TrackingMore/auto groups contain up to 20 numbers, Tencent groups up to 10. The TrackingMore browser runs directly from the server by default; an optional browser proxy can be configured as described below.
 
 ---
 
@@ -301,8 +306,11 @@ npm run build && npm start
 | `LOG_LEVEL`                  | `info`                        | Pino log level                                |
 | `RATE_LIMIT_MAX`             | `60`                          | Requests per window per IP                    |
 | `RATE_LIMIT_WINDOW`          | `1 minute`                    | Rate-limit window                             |
-| `TWOCAPTCHA_API_KEY`         | unset                         | Optional 2Captcha key for J&T TencentTaskProxyless; local solver is fallback |
-| `JT_BULK_CONCURRENCY`        | `5`                           | Concurrent J&T workers for REST, benchmark, and MCP bulk/summary paths; clamped to 1..10 |
+| `CAPSOLVER_API_KEY`          | unset                         | Primary TrackingMore Turnstile solver key; 2Captcha is used only if Capsolver fails |
+| `TWOCAPTCHA_API_KEY`         | unset                         | Secondary TrackingMore Turnstile solver and TencentTaskProxyless key (never expose these values) |
+| `TRACKINGMORE_PROXY_URL`      | unset                         | Optional proxy URL for TrackingMore's Playwright browser; direct server IP is used when unset |
+| `JT_PROXY_URL`                | unset                         | Backward-compatible TrackingMore proxy fallback when `TRACKINGMORE_PROXY_URL` is unset |
+| `JT_BULK_CONCURRENCY`        | `5`                           | Concurrent J&T groups (up to 20 for TrackingMore/auto; 10 for Tencent) for REST, benchmark, and MCP bulk/summary paths; clamped to 1..10. Consider 2–5 on memory-constrained hosts |
 | `MCP_AUTH_TOKEN`             | unset                         | MCP OAuth/admin bearer token                  |
 | `MCP_PUBLIC_URL`             | production URL                | Public base URL used by MCP OAuth metadata    |
 
@@ -348,12 +356,11 @@ Plain HTML site. We POST `order=<waybill>` to
 
 ### J&T Express
 
-Playwright loads the tracking page and, when `TWOCAPTCHA_API_KEY` is set,
-solves Tencent through 2Captcha's `TencentTaskProxyless` task. The resulting
-`ticket` and `randstr` are delivered to the page callback end-to-end. Robust
-one-second polling is bounded by a timeout and validates provider responses.
-The local slider solver (Sobel edge detection + NCC + humanlike drag) is kept
-as a fallback.
+The provider orchestrator defaults to TrackingMore, with groups of up to 20, and falls back to Tencent groups of up to 10 only on TrackingMore provider failure. Explicit provider modes do not switch providers.
+
+TrackingMore uses direct query-URL navigation in a reusable Playwright Chromium process. Its Cloudflare Turnstile token comes from Capsolver first and 2Captcha only after Capsolver failure. The page's native verification callback receives the token, and extraction waits for all requested `app.trackEnd` records to settle before mapping statuses and events.
+
+For Tencent, Playwright loads the native J&T page and 2Captcha's `TencentTaskProxyless` returns `ticket` and `randstr` to the page callback. Robust polling is timeout-bounded and validates provider responses. The local slider solver (Sobel edge detection + NCC + humanlike drag) remains an internal Tencent fallback.
 
 ### JDW Logistics (JINGDONG)
 

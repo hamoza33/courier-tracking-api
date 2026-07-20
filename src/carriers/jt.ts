@@ -86,7 +86,7 @@ interface JtV2Detail {
   [k: string]: unknown;
 }
 
-interface JtV2Response {
+export interface JtV2Response {
   code?: number;
   msg?: string;
   succ?: boolean;
@@ -96,7 +96,7 @@ interface JtV2Response {
   }>;
 }
 
-interface JtOptions {
+export interface JtOptions {
   lang?: string;
 }
 
@@ -249,7 +249,7 @@ async function humanlikeDrag(
 
 async function solveAndTrack(
   browser: Browser,
-  waybillNo: string,
+  waybillNos: readonly string[],
   externalSolver = true,
 ): Promise<JtV2Response> {
   const context = await browser.newContext({
@@ -258,6 +258,20 @@ async function solveAndTrack(
     viewport: { width: 1280, height: 800 },
   });
   const page = await context.newPage();
+  // The public page lists multiple waybills but normally submits only the selected
+  // left-side item. Rewrite that one authenticated request so the same captcha
+  // ticket is used with J&T's native waybillNo array (maximum ten).
+  if (waybillNos.length > 1) {
+    await page.route("**/official/logisticsTracking/v2/getDetailByWaybillNo**", async (route) => {
+      const request = route.request();
+      try {
+        const payload = request.postDataJSON() as Record<string, unknown>;
+        await route.continue({ postData: JSON.stringify({ ...payload, waybillNo: [...waybillNos] }) });
+      } catch {
+        await route.continue();
+      }
+    });
+  }
   await page.addInitScript(({ useExternalSolver }) => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     if (useExternalSolver) {
@@ -323,7 +337,8 @@ async function solveAndTrack(
   });
 
   try {
-    await page.goto(`${JT_URL}?waybillNo=${waybillNo}`, {
+    const query = encodeURIComponent(waybillNos.join(","));
+    await page.goto(`${JT_URL}?waybillNo=${query}&type=0`, {
       waitUntil: "domcontentloaded",
       timeout: 30000,
     });
@@ -404,74 +419,69 @@ function deriveJtStatus(d: JtV2Detail): string | null {
   return null;
 }
 
-// ---------- Main export ----------
+// ---------- Main exports ----------
 
-export async function trackJt(
-  waybillNo: string,
-  opts: JtOptions = {}
-): Promise<TrackResult> {
-  const wb = waybillNo.trim();
+function resultFromRecord(wb: string, record?: NonNullable<JtV2Response["data"]>[number]): TrackResult {
+  const events: TrackEvent[] = (record?.details ?? []).map((d) => ({
+    time: d.scanTime ?? null,
+    status: deriveJtStatus(d),
+    description: (d.customerTracking || d.scanTypeName || "").trim(),
+    location: [d.scanNetworkName, d.scanNetworkCity].filter(Boolean).join(", ") || null,
+  }));
+  const latestEvent = events[0];
+  const ns = latestEvent ? normalizeStatus(latestEvent.status, latestEvent.description, "jt") : null;
+  return {
+    carrier: "jt", carrierName: "J&T Express", waybillNo: record?.keyword ?? wb,
+    found: events.length > 0, latestStatus: ns ?? latestEvent?.status ?? null,
+    latestStatusDetail: latestEvent?.status ?? null, latestTime: latestEvent?.time ?? null,
+    normalizedStatus: ns, undeliveryReason: extractUndeliveryReason(events, ns, "jt"), events,
+  };
+}
+
+/** Map API records to requested inputs, retaining request order, duplicates, and misses. */
+export function mapJtBatchResponse(waybills: readonly string[], response: JtV2Response): TrackResult[] {
+  const records = new Map<string, NonNullable<JtV2Response["data"]>[number]>();
+  for (const record of response.data ?? []) {
+    const keyword = record.keyword?.trim();
+    if (keyword && !records.has(keyword)) records.set(keyword, record);
+  }
+  return waybills.map((waybill) => {
+    const wb = waybill.trim();
+    return resultFromRecord(wb, records.get(wb));
+  });
+}
+
+export async function trackJtBatch(waybillNos: readonly string[], opts: JtOptions = {}): Promise<TrackResult[]> {
+  void opts;
+  if (waybillNos.length === 0) throw new CarrierError("jt", "At least one J&T waybill is required", { statusCode: 400 });
+  if (waybillNos.length > 10) throw new CarrierError("jt", "Maximum 10 J&T waybills per batch", { statusCode: 400 });
+  const waybills = waybillNos.map((value) => value.trim());
+  if (waybills.some((value) => !value)) throw new CarrierError("jt", "J&T waybills must not be empty", { statusCode: 400 });
 
   const apiKeyConfigured = Boolean(process.env.TWOCAPTCHA_API_KEY?.trim());
   const maxAttempts = apiKeyConfigured ? 4 : 3;
   let lastError: Error | null = null;
   let externalFailure: string | null = null;
-
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const browser = await getBrowser();
-      // Prefer 2Captcha once when configured; preserve the proven local image
-      // solver as three fallback attempts (and as the no-key default).
-      const useExternalSolver = apiKeyConfigured && attempt === 1;
-      const response = await solveAndTrack(browser, wb, useExternalSolver);
-
+      const response = await solveAndTrack(await getBrowser(), waybills, apiKeyConfigured && attempt === 1);
       if (!response.succ && response.code !== 1) {
-        throw new CarrierError(
-          "jt",
-          `J&T Express returned error code ${response.code}: ${response.msg ?? ""}`,
-          { statusCode: 502 }
-        );
+        throw new CarrierError("jt", `J&T Express returned error code ${response.code}: ${response.msg ?? ""}`, { statusCode: 502 });
       }
-
-      const record = response.data?.[0];
-      const events: TrackEvent[] = (record?.details ?? []).map((d) => ({
-        time: d.scanTime ?? null,
-        status: deriveJtStatus(d),
-        description: (d.customerTracking || d.scanTypeName || "").trim(),
-        location:
-          [d.scanNetworkName, d.scanNetworkCity]
-            .filter(Boolean)
-            .join(", ") || null,
-      }));
-
-      const latestEvent = events[0];
-      const ns = latestEvent
-        ? normalizeStatus(latestEvent.status, latestEvent.description, "jt")
-        : null;
-
-      return {
-        carrier: "jt",
-        carrierName: "J&T Express",
-        waybillNo: record?.keyword ?? wb,
-        found: events.length > 0,
-        latestStatus: ns ?? latestEvent?.status ?? null,
-        latestStatusDetail: latestEvent?.status ?? null,
-        latestTime: latestEvent?.time ?? null,
-        normalizedStatus: ns,
-        undeliveryReason: extractUndeliveryReason(events, ns, "jt"),
-        events,
-      };
+      return mapJtBatchResponse(waybills, response);
     } catch (err) {
       lastError = err as Error;
       if (apiKeyConfigured && attempt === 1) externalFailure = lastError.message;
       if (err instanceof CarrierError) throw err;
-      // Retry captcha failures; after an external-solver error, use local fallback.
     }
   }
-
   throw new CarrierError(
     "jt",
     `J&T Express captcha failed after ${maxAttempts} attempts: ${lastError?.message ?? "unknown"}${externalFailure ? ` (2Captcha: ${externalFailure})` : ""}`,
-    { statusCode: 502, captchaRequired: true }
+    { statusCode: 502, captchaRequired: true },
   );
+}
+
+export async function trackJt(waybillNo: string, opts: JtOptions = {}): Promise<TrackResult> {
+  return (await trackJtBatch([waybillNo], opts))[0];
 }
