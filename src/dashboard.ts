@@ -134,6 +134,12 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <h2>Tracking Numbers</h2>
     <textarea id="waybillInput" placeholder="Paste tracking numbers here — one per line, or comma / space separated.&#10;&#10;Examples:&#10;6050926815554&#10;JDW101107292775&#10;JTE000944462953"></textarea>
     <div class="actions">
+      <label for="jtProvider"><strong>J&amp;T Provider</strong></label>
+      <select id="jtProvider" title="Choose how J&T shipments are tracked">
+        <option value="auto" selected>TrackingMore primary → Tencent fallback</option>
+        <option value="trackingmore">TrackingMore only</option>
+        <option value="tencent">Tencent only</option>
+      </select>
       <button class="btn btn-primary" id="trackBtn" onclick="startTracking()">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
         Track All
@@ -199,14 +205,16 @@ let apiOnline = null;
 const STORAGE_KEY = 'courier_dashboard_waybills';
 // Tracking is non-idempotent from the CAPTCHA provider's perspective: retrying a
 // timed-out bulk request duplicates every solve while the original keeps running.
-// Large J&T batches are processed as groups of up to ten waybills per CAPTCHA.
+// J&T batches use up to 20 numbers for TrackingMore/auto and 10 for Tencent.
 const MAX_RETRIES = 0;
 const MIN_REQUEST_TIMEOUT_MS = 180000;
 const MAX_REQUEST_TIMEOUT_MS = 1800000;
 
-function bulkRequestTimeoutMs(count) {
-  // Budget roughly 35 seconds per wave of ten-waybill groups at five concurrent groups.
-  return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(MIN_REQUEST_TIMEOUT_MS, Math.ceil(Math.ceil(count / 10) / 5) * 35000 + 60000));
+function bulkRequestTimeoutMs(count, jtProvider) {
+  // Auto/TrackingMore groups carry 20; Tencent groups carry 10. Auto reserves fallback time.
+  const groupSize = jtProvider === 'tencent' ? 10 : 20;
+  const perWaveMs = jtProvider === 'auto' ? 70000 : 35000;
+  return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(MIN_REQUEST_TIMEOUT_MS, Math.ceil(Math.ceil(count / groupSize) / 5) * perWaveMs + 60000));
 }
 
 function parseWaybills(text) {
@@ -346,22 +354,24 @@ async function startTracking() {
   msg.classList.remove('error');
   bar.classList.add('active');
   fill.style.width = '10%';
-  msg.textContent = 'Submitting ' + waybills.length + ' waybill(s) for concurrent batch processing...';
+  const jtProvider = document.getElementById('jtProvider').value;
+  const providerLabel = document.getElementById('jtProvider').selectedOptions[0].textContent;
+  msg.textContent = 'Submitting ' + waybills.length + ' waybill(s); J&T: ' + providerLabel + '...';
 
   let progress = 10;
   const startedAt = Date.now();
   const timer = setInterval(() => {
     progress = Math.min(progress + Math.max(0.5, (90 - progress) * 0.04), 90);
     fill.style.width = progress + '%';
-    msg.textContent = 'Batch processing in parallel on the server — ' + Math.round((Date.now() - startedAt) / 1000) + 's elapsed (J&T concurrency is controlled).';
+    msg.textContent = 'Batch processing — ' + Math.round((Date.now() - startedAt) / 1000) + 's elapsed (J&T: ' + providerLabel + ').';
   }, 1000);
 
   try {
     const resp = await fetchWithRetry('/track/bulk', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ waybills, order: 'desc' }),
-    }, MAX_RETRIES, bulkRequestTimeoutMs(waybills.length));
+      body: JSON.stringify({ waybills, order: 'desc', jtProvider }),
+    }, MAX_RETRIES, bulkRequestTimeoutMs(waybills.length, jtProvider));
 
     const data = await resp.json();
     clearInterval(timer);
@@ -392,6 +402,9 @@ async function startTracking() {
         undeliveryReason: r.result?.undeliveryReason || null,
         extra: extra,
         warnings: warnings,
+        source: extra.source || null,
+        provider: extra.provider || null,
+        fallback: extra.fallback === true,
         origin: extra.sendSite || extra.originCity || extra.senderCity || null,
         destination: extra.dispatchStation || extra.destCity || extra.receiverCity || null,
         country: extra.country || null,
@@ -551,10 +564,13 @@ function renderExtraInfo(r) {
   if (r.origin) parts.push('<span class="extra-tag">From: ' + escHtml(r.origin) + '</span>');
   if (r.destination) parts.push('<span class="extra-tag">To: ' + escHtml(r.destination) + '</span>');
   if (r.country) parts.push('<span class="extra-tag">' + escHtml(r.country) + '</span>');
+  if (r.source) parts.push('<span class="extra-tag">Source: ' + escHtml(r.source) + '</span>');
+  if (r.provider) parts.push('<span class="extra-tag">Provider: ' + escHtml(r.provider) + '</span>');
+  if (r.fallback) parts.push('<span class="warning-tag">Fallback used</span>');
   if (r.warnings && r.warnings.length > 0) {
     r.warnings.forEach(w => parts.push('<span class="warning-tag">' + escHtml(w) + '</span>'));
   }
-  const extraKeys = Object.keys(r.extra || {}).filter(k => !['sendSite','dispatchStation','country','originCity','destCity','senderCity','receiverCity'].includes(k));
+  const extraKeys = Object.keys(r.extra || {}).filter(k => !['sendSite','dispatchStation','country','originCity','destCity','senderCity','receiverCity','source','provider','fallback'].includes(k));
   extraKeys.forEach(k => {
     const v = r.extra[k];
     if (v !== null && v !== undefined && v !== '') {

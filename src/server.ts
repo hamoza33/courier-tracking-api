@@ -18,7 +18,7 @@ import { buildMcpServer } from "./mcp.js";
 import { CourierMcpOAuthProvider } from "./oauth.js";
 import { trackImile } from "./carriers/imile.js";
 import { trackInjaz } from "./carriers/injaz.js";
-import { trackJt, trackJtBatch } from "./carriers/jt.js";
+import { getJtProviderBatchSize, parseJtProvider, trackJt, trackJtBatch } from "./carriers/jt-provider.js";
 import { trackJdw } from "./carriers/jdw.js";
 import { trackNaqel } from "./carriers/naqel.js";
 import { CarrierError, type Carrier, type TrackResult } from "./types.js";
@@ -136,6 +136,7 @@ async function start() {
         pretty: "'1' for pretty-printed JSON.",
         lang: "Optional language hint, e.g. en, ar.",
         carrier: "On /track: force a carrier (imile|injaz|jdw|naqel|jt) or 'all'.",
+        jtProvider: "J&T provider: auto (TrackingMore then Tencent fallback), trackingmore, or tencent.",
       },
     })
   );
@@ -186,7 +187,7 @@ async function start() {
   // ----- tracking endpoints -----
 
   // GET /track?waybill=...&lang=en[&carrier=imile][&format=text][&pretty=1][&order=desc]
-  fastify.get<{ Querystring: { waybill?: string; lang?: string; carrier?: string; format?: string; pretty?: string; order?: string } }>(
+  fastify.get<{ Querystring: { waybill?: string; lang?: string; carrier?: string; jtProvider?: string; format?: string; pretty?: string; order?: string } }>(
     "/track",
     {
       schema: {
@@ -203,6 +204,7 @@ async function start() {
               enum: ["imile", "injaz", "jt", "jdw", "naqel", "auto", "all"],
               description: "Force a specific carrier, or 'all' to query every carrier in parallel",
             },
+            jtProvider: { type: "string", enum: ["auto", "trackingmore", "tencent"], description: "J&T provider (default: auto = TrackingMore primary, Tencent fallback)" },
             order: {
               type: "string",
               enum: ["desc", "asc"],
@@ -231,22 +233,22 @@ async function start() {
       const order = getOrder(req);
 
       if (carrier === "all") {
-        const results = await runAll(waybill, lang);
+        const results = await runAll(waybill, lang, req.query.jtProvider);
         applyOrderToMulti(results, order);
         return sendResult(req, reply, results, true);
       }
       if (carrier !== "auto") {
-        const single = await runOneOrError(carrier as Carrier, waybill, lang);
+        const single = await runOneOrError(carrier as Carrier, waybill, lang, req.query.jtProvider);
         applyOrder(single, order);
         return sendResult(req, reply, single, false);
       }
       const detected = detectCarrier(waybill);
       if (!detected) {
-        const results = await runAll(waybill, lang);
+        const results = await runAll(waybill, lang, req.query.jtProvider);
         applyOrderToMulti(results, order);
         return sendResult(req, reply, results, true);
       }
-      const single = await runOneOrError(detected, waybill, lang);
+      const single = await runOneOrError(detected, waybill, lang, req.query.jtProvider);
       applyOrder(single, order);
       return sendResult(req, reply, single, false);
     }
@@ -431,7 +433,7 @@ async function start() {
   }
 
   // GET /track/:carrier/:waybill[?format=text&pretty=1&order=desc]
-  fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string; format?: string; pretty?: string; order?: string } }>(
+  fastify.get<{ Params: { carrier: string; waybill: string }; Querystring: { lang?: string; jtProvider?: string; format?: string; pretty?: string; order?: string } }>(
     "/track/:carrier/:waybill",
     {
       schema: {
@@ -449,6 +451,7 @@ async function start() {
           type: "object",
           properties: {
             lang: { type: "string" },
+            jtProvider: { type: "string", enum: ["auto", "trackingmore", "tencent"], description: "J&T provider (default: auto)" },
             format: { type: "string", enum: ["json", "text"] },
             pretty: { type: "string" },
             order: { type: "string", enum: ["desc", "asc"] },
@@ -460,7 +463,7 @@ async function start() {
       const { carrier, waybill } = req.params;
       const lang = req.query.lang;
       const order = getOrder(req);
-      const single = await runOneOrError(carrier as Carrier, waybill, lang);
+      const single = await runOneOrError(carrier as Carrier, waybill, lang, req.query.jtProvider);
       applyOrder(single, order);
       return sendResult(req, reply, single, false);
     }
@@ -499,11 +502,12 @@ async function start() {
     if (isArray) {
       jsonPayload = (payload as MultiTrackResult[]).map((m) =>
         m.result
-          ? { carrier: m.carrier, result: normalizeForJson(m.result, fmtOpts) }
+          ? { carrier: m.carrier, result: { ...normalizeForJson(m.result, fmtOpts), warnings: m.result.warnings } }
           : { carrier: m.carrier, error: m.error }
       );
     } else {
-      jsonPayload = normalizeForJson(payload as TrackResult, fmtOpts);
+      const result = payload as TrackResult;
+      jsonPayload = { ...normalizeForJson(result, fmtOpts), warnings: result.warnings };
     }
 
     if (wantsPretty(req)) {
@@ -517,7 +521,8 @@ async function start() {
   async function runOneOrError(
     carrier: Carrier,
     waybill: string,
-    lang: string | undefined
+    lang: string | undefined,
+    jtProvider?: string
   ): Promise<TrackResult | { error: string; carrier?: string; captchaRequired?: boolean; statusCode: number }> {
     if (!ALL_CARRIERS.includes(carrier)) {
       return { error: `Unknown carrier ${carrier}`, statusCode: 400 };
@@ -529,7 +534,7 @@ async function start() {
         case "injaz":
           return await trackInjaz(waybill);
         case "jt":
-          return await trackJt(waybill, { lang });
+          return await trackJt(waybill, { lang, provider: jtProvider as any });
         case "jdw":
           return await trackJdw(waybill, lang);
         case "naqel":
@@ -549,9 +554,9 @@ async function start() {
     }
   }
 
-  async function runAll(waybill: string, lang?: string) {
+  async function runAll(waybill: string, lang?: string, jtProvider?: string) {
     const tasks = ALL_CARRIERS.map((c) =>
-      runOneSafe(c, waybill, lang).then((r) => ({ carrier: c, result: r.result, error: r.error }))
+      runOneSafe(c, waybill, lang, jtProvider).then((r) => ({ carrier: c, result: r.result, error: r.error }))
     );
     return Promise.all(tasks);
   }
@@ -559,7 +564,8 @@ async function start() {
   async function runOneSafe(
     carrier: Carrier,
     waybill: string,
-    lang?: string
+    lang?: string,
+    jtProvider?: string
   ): Promise<{ result?: TrackResult; error?: { message: string; captchaRequired?: boolean } }> {
     try {
       switch (carrier) {
@@ -568,7 +574,7 @@ async function start() {
         case "injaz":
           return { result: await trackInjaz(waybill) };
         case "jt":
-          return { result: await trackJt(waybill, { lang }) };
+          return { result: await trackJt(waybill, { lang, provider: jtProvider as any }) };
         case "jdw":
           return { result: await trackJdw(waybill, lang) };
         case "naqel":
@@ -602,7 +608,7 @@ async function start() {
 
   // ----- bulk tracking endpoint -----
 
-  type BulkItem = { waybill: string; carrier?: string; lang?: string };
+  type BulkItem = { waybill: string; carrier?: string; lang?: string; jtProvider?: string };
   type BulkResultItem = {
     waybill: string;
     carrier: string;
@@ -630,17 +636,17 @@ async function start() {
       return { waybill, carrier: "unknown", error: { message: "Could not detect carrier for this waybill" } };
     }
 
-    const res = await runOneSafe(carrier, waybill, lang);
+    const res = await runOneSafe(carrier, waybill, lang, item.jtProvider);
     return { waybill, carrier, result: res.result, error: res.error };
   }
 
   // POST /track/bulk
-  fastify.post<{ Body: { waybills: (string | BulkItem)[]; lang?: string; order?: string } }>(
+  fastify.post<{ Body: { waybills: (string | BulkItem)[]; lang?: string; jtProvider?: string; order?: string } }>(
     "/track/bulk",
     {
       schema: {
         tags: ["tracking"],
-        summary: `Track up to 250 waybills at once. J&T is grouped into batches of up to 10 per CAPTCHA with ${getJtBulkConcurrency()} concurrent groups.`,
+        summary: `Track up to 250 waybills at once. J&T uses TrackingMore/auto groups of up to 20 and Tencent groups of up to 10 with ${getJtBulkConcurrency()} concurrent groups.`,
         body: {
           type: "object",
           required: ["waybills"],
@@ -657,6 +663,7 @@ async function start() {
                       waybill: { type: "string" },
                       carrier: { type: "string", enum: ["imile", "injaz", "jt", "jdw", "naqel", "auto"] },
                       lang: { type: "string" },
+                      jtProvider: { type: "string", enum: ["auto", "trackingmore", "tencent"] },
                     },
                     required: ["waybill"],
                   },
@@ -665,13 +672,14 @@ async function start() {
               description: "Array of waybill numbers or objects with waybill + optional carrier/lang. Max 250.",
             },
             lang: { type: "string", description: "Default language for all waybills" },
+            jtProvider: { type: "string", enum: ["auto", "trackingmore", "tencent"], description: "Default J&T provider; per-item value overrides it" },
             order: { type: "string", enum: ["desc", "asc"], description: "Event sort order (default: desc)" },
           },
         },
       },
     },
     async (req, reply) => {
-      const { waybills, lang: defaultLang, order: orderParam } = req.body;
+      const { waybills, lang: defaultLang, jtProvider: defaultJtProvider, order: orderParam } = req.body;
       if (!waybills || waybills.length === 0) {
         return reply.code(400).send({ error: "waybills array is required and must not be empty" });
       }
@@ -683,7 +691,7 @@ async function start() {
 
       // Normalize input: strings become BulkItem objects
       const items: BulkItem[] = waybills.map((w) =>
-        typeof w === "string" ? { waybill: w, lang: defaultLang } : { ...w, lang: w.lang ?? defaultLang }
+        typeof w === "string" ? { waybill: w, lang: defaultLang, jtProvider: defaultJtProvider } : { ...w, lang: w.lang ?? defaultLang, jtProvider: w.jtProvider ?? defaultJtProvider }
       );
 
       const jtConcurrency = getJtBulkConcurrency();
@@ -694,9 +702,13 @@ async function start() {
         orderedResults[entry.index] = await trackOneBulk(entry.item);
       }));
       const jtEntries = indexed.filter((entry) => entry.carrier === "jt");
-      const jtGroups = chunkItems(jtEntries, 10);
+      const jtGroups = [...new Set(jtEntries.map((entry) => entry.item.jtProvider ?? "auto"))]
+        .flatMap((provider) => chunkItems(
+          jtEntries.filter((entry) => (entry.item.jtProvider ?? "auto") === provider),
+          getJtProviderBatchSize(parseJtProvider(provider)),
+        ));
       const jtPromise = mapConcurrent(jtGroups, jtConcurrency, async (group) => {
-        const batch = await trackJtBatch(group.map((entry) => entry.item.waybill), { lang: group[0]?.item.lang });
+        const batch = await trackJtBatch(group.map((entry) => entry.item.waybill), { lang: group[0]?.item.lang, provider: group[0]?.item.jtProvider as any });
         return group.map((entry, index) => ({ entry, result: batch[index] }));
       });
       const [, jtOutcomes] = await Promise.all([nonJtPromise, jtPromise]);
@@ -725,7 +737,7 @@ async function start() {
   // ----- benchmark endpoint -----
 
   // POST /track/benchmark
-  fastify.post<{ Body: { waybills: (string | BulkItem)[]; lang?: string } }>(
+  fastify.post<{ Body: { waybills: (string | BulkItem)[]; lang?: string; jtProvider?: string } }>(
     "/track/benchmark",
     {
       schema: {
@@ -741,18 +753,19 @@ async function start() {
               items: {
                 oneOf: [
                   { type: "string" },
-                  { type: "object", properties: { waybill: { type: "string" }, carrier: { type: "string" }, lang: { type: "string" } }, required: ["waybill"] },
+                  { type: "object", properties: { waybill: { type: "string" }, carrier: { type: "string" }, lang: { type: "string" }, jtProvider: { type: "string", enum: ["auto", "trackingmore", "tencent"] } }, required: ["waybill"] },
                 ],
               },
               description: "Array of up to 250 waybill numbers. The first 50 are used for the 50-batch benchmark; all are used for the full-batch benchmark.",
             },
             lang: { type: "string", description: "Default language for all waybills" },
+            jtProvider: { type: "string", enum: ["auto", "trackingmore", "tencent"], description: "Default J&T provider; per-item value overrides it" },
           },
         },
       },
     },
     async (req, reply) => {
-      const { waybills, lang: defaultLang } = req.body;
+      const { waybills, lang: defaultLang, jtProvider: defaultJtProvider } = req.body;
       if (!waybills || waybills.length === 0) {
         return reply.code(400).send({ error: "waybills array is required and must not be empty" });
       }
@@ -762,7 +775,7 @@ async function start() {
 
       // Normalize input
       const items: BulkItem[] = waybills.map((w) =>
-        typeof w === "string" ? { waybill: w, lang: defaultLang } : { ...w, lang: w.lang ?? defaultLang }
+        typeof w === "string" ? { waybill: w, lang: defaultLang, jtProvider: defaultJtProvider } : { ...w, lang: w.lang ?? defaultLang, jtProvider: w.jtProvider ?? defaultJtProvider }
       );
 
       // Helper: run non-J&T without a limit and J&T with the configured worker pool.
@@ -774,9 +787,13 @@ async function start() {
           results[entry.index] = await trackOneBulk(entry.item);
         }));
         const jtEntries = indexed.filter((entry) => entry.carrier === "jt");
-        const jtGroups = chunkItems(jtEntries, 10);
+        const jtGroups = [...new Set(jtEntries.map((entry) => entry.item.jtProvider ?? "auto"))]
+          .flatMap((provider) => chunkItems(
+          jtEntries.filter((entry) => (entry.item.jtProvider ?? "auto") === provider),
+          getJtProviderBatchSize(parseJtProvider(provider)),
+        ));
         const jtPromise = mapConcurrent(jtGroups, getJtBulkConcurrency(), async (group) => {
-          const batchResults = await trackJtBatch(group.map((entry) => entry.item.waybill), { lang: group[0]?.item.lang });
+          const batchResults = await trackJtBatch(group.map((entry) => entry.item.waybill), { lang: group[0]?.item.lang, provider: group[0]?.item.jtProvider as any });
           return group.map((entry, index) => ({ entry, result: batchResults[index] }));
         });
         const [, outcomes] = await Promise.all([nonJtPromise, jtPromise]);
