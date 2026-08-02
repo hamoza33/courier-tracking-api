@@ -3,6 +3,7 @@ import sharp from "sharp";
 import { cv } from "opencv-wasm";
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
 import { normalizeStatus, extractUndeliveryReason } from "../normalize.js";
+import { getTwoCaptchaApiKey } from "../runtime-config.js";
 
 const JT_URL = "https://www.jtexpress.me/KSA/trajectoryQuery";
 const CAPTCHA_SCRIPT = "https://ca.turing.captcha.qcloud.com/TCaptcha-global.js";
@@ -291,7 +292,7 @@ async function solveAndTrack(
 
   if (externalSolver) {
     await page.exposeFunction("__jtSolveTencent", async (appId: string) => {
-      const apiKey = process.env.TWOCAPTCHA_API_KEY;
+      const apiKey = getTwoCaptchaApiKey();
       if (!apiKey) throw new Error("TWOCAPTCHA_API_KEY is not configured");
       return solveTencentCaptcha(apiKey, appId);
     });
@@ -458,7 +459,7 @@ export async function trackJtBatch(waybillNos: readonly string[], opts: JtOption
   const waybills = waybillNos.map((value) => value.trim());
   if (waybills.some((value) => !value)) throw new CarrierError("jt", "J&T waybills must not be empty", { statusCode: 400 });
 
-  const apiKeyConfigured = Boolean(process.env.TWOCAPTCHA_API_KEY?.trim());
+  const apiKeyConfigured = Boolean(getTwoCaptchaApiKey());
   const maxAttempts = apiKeyConfigured ? 4 : 3;
   let lastError: Error | null = null;
   let externalFailure: string | null = null;

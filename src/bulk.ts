@@ -1,7 +1,8 @@
 import { detectCarrier, ALL_CARRIERS } from "./detect.js";
 import type { Carrier } from "./types.js";
+import { getJtBulkConcurrencyRaw } from "./runtime-config.js";
 
-export function getJtBulkConcurrency(envValue = process.env.JT_BULK_CONCURRENCY): number {
+export function getJtBulkConcurrency(envValue = getJtBulkConcurrencyRaw()): number {
   const parsed = Number.parseInt(envValue ?? "5", 10);
   return Number.isFinite(parsed) ? Math.max(1, Math.min(10, parsed)) : 5;
 }
