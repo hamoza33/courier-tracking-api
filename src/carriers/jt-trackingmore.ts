@@ -1,6 +1,7 @@
 import { chromium, type Browser, type BrowserContext, type LaunchOptions, type Page } from "playwright";
 import { CarrierError, type TrackEvent, type TrackResult } from "../types.js";
 import { extractUndeliveryReason, normalizeStatus } from "../normalize.js";
+import { getCapsolverApiKey, getTwoCaptchaApiKey } from "../runtime-config.js";
 
 const TRACKINGMORE_ORIGIN = "https://www.trackingmore.com";
 const TRACKINGMORE_CARRIER = "jtexpress-ae";
@@ -452,8 +453,8 @@ async function readSettledTrackEnd(page: Page, expected: number): Promise<Tracki
 
 export async function runBrowserFlow(values: readonly string[], opts: TrackingMoreOptions): Promise<TrackingMoreTrackEnd[]> {
   const solverKeys: TurnstileSolverKeys = {
-    capsolver: process.env.CAPSOLVER_API_KEY?.trim(),
-    twoCaptcha: process.env.TWOCAPTCHA_API_KEY?.trim(),
+    capsolver: getCapsolverApiKey(),
+    twoCaptcha: getTwoCaptchaApiKey(),
   };
   if (!solverKeys.capsolver && !solverKeys.twoCaptcha) {
     throw new CarrierError("jt", "TrackingMore requires CAPSOLVER_API_KEY or TWOCAPTCHA_API_KEY", { statusCode: 503, captchaRequired: true });

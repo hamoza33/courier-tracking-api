@@ -30,6 +30,26 @@ import {
 } from "./format.js";
 import { chunkItems, getJtBulkConcurrency, mapConcurrent, resolveBulkCarrier } from "./bulk.js";
 import { DASHBOARD_HTML } from "./dashboard.js";
+import { timingSafeEqual } from "node:crypto";
+import {
+  getMaskedRuntimeConfig,
+  updateRuntimeConfig,
+  type RuntimeConfigPatch,
+} from "./runtime-config.js";
+
+const ADMIN_CONFIG_TOKEN =
+  process.env.ADMIN_CONFIG_TOKEN?.trim() || process.env.MCP_AUTH_TOKEN?.trim();
+
+/** Constant-time compare of the presented admin token against the configured one. */
+function isAdminAuthorized(req: import("fastify").FastifyRequest): boolean {
+  if (!ADMIN_CONFIG_TOKEN) return false;
+  const header = req.headers["x-admin-token"];
+  const presented = Array.isArray(header) ? header[0] : header;
+  if (typeof presented !== "string" || presented.length === 0) return false;
+  const a = Buffer.from(presented);
+  const b = Buffer.from(ADMIN_CONFIG_TOKEN);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 type MultiTrackResult = { carrier: string; result?: TrackResult; error?: { message: string; captchaRequired?: boolean } };
 
@@ -182,6 +202,69 @@ async function start() {
       { code: "jdw", name: "JDW Logistics (JINGDONG)", captchaRequired: false },
       { code: "naqel", name: "Naqel Express", captchaRequired: false },
     ]
+  );
+
+  // ----- admin config endpoints -----
+  // Dashboard-editable CAPTCHA solver keys + J&T concurrency. Protected by the
+  // shared ADMIN_CONFIG_TOKEN (falls back to MCP_AUTH_TOKEN). Secrets are never
+  // returned — reads only expose a masked hint and whether a value is set.
+
+  fastify.get(
+    "/admin/config",
+    { schema: { hide: true }, config: { rateLimit: false } },
+    async (request, reply) => {
+      if (!ADMIN_CONFIG_TOKEN) {
+        return reply.code(503).send({ error: "admin config disabled" });
+      }
+      if (!isAdminAuthorized(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      return getMaskedRuntimeConfig();
+    }
+  );
+
+  fastify.patch<{
+    Body: {
+      capsolverApiKey?: string | null;
+      twoCaptchaApiKey?: string | null;
+      jtBulkConcurrency?: number | string | null;
+    };
+  }>(
+    "/admin/config",
+    { schema: { hide: true }, config: { rateLimit: false } },
+    async (request, reply) => {
+      if (!ADMIN_CONFIG_TOKEN) {
+        return reply.code(503).send({ error: "admin config disabled" });
+      }
+      if (!isAdminAuthorized(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      const body = request.body ?? {};
+      const patch: RuntimeConfigPatch = {};
+      if ("capsolverApiKey" in body) {
+        patch.capsolverApiKey =
+          body.capsolverApiKey === null ? null : String(body.capsolverApiKey);
+      }
+      if ("twoCaptchaApiKey" in body) {
+        patch.twoCaptchaApiKey =
+          body.twoCaptchaApiKey === null ? null : String(body.twoCaptchaApiKey);
+      }
+      if ("jtBulkConcurrency" in body) {
+        const raw = body.jtBulkConcurrency;
+        if (raw === null || raw === undefined || raw === "") {
+          patch.jtBulkConcurrency = null;
+        } else {
+          const n = typeof raw === "number" ? raw : Number.parseInt(raw, 10);
+          if (!Number.isFinite(n)) {
+            return reply
+              .code(400)
+              .send({ error: "jtBulkConcurrency must be a number" });
+          }
+          patch.jtBulkConcurrency = n;
+        }
+      }
+      return updateRuntimeConfig(patch);
+    }
   );
 
   // ----- tracking endpoints -----
